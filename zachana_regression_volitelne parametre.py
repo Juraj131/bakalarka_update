@@ -435,113 +435,156 @@ def spusti_experimenty():
     num_workers = 5 # Pre jednoduchšie ladenie, potom môžeš zvýšiť na napr. 5
 
     # --- DEFINÍCIA EXPERIMENTOV ---
-    # --- DEFINÍCIA EXPERIMENTOV ---
+    # (Pôvodné run_id_suffix budú prepísané dynamicky generovanými)
     experiments = [
         # --- SÉRIA 1: ResNet34, sin/cos vstup, ladenie GDL a augmentácií ---
         {
-            "run_id_suffix": "R34_sincos_MAE_GDL0.05_AugStrong",
+            "run_id_suffix": "AUTO_GENERATED", # Dynamicky generované run_id
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
-            "input_processing": "sincos", "augmentation_strength": "strong",
-            "loss_type": "mae_gdl", "lambda_gdl": 0.05, # Nízka GDL
-            "lr": 1e-4, "bs": 8, "epochs": 50, "es_pat": 17, "sch_pat": 7
+            "input_processing": "direct_minmax", "augmentation_strength": "strong",
+            "loss_type": "mae_gdl", "lambda_gdl": 0.1, # Nízka GDL
+            "lr": 1e-3, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 10
         },
         {
-            "run_id_suffix": "R34_sincos_MAE_GDL0.1_AugStrong", # Referenčný z úspešného behu (alebo veľmi blízky)
-            "encoder_name": "efficientnet-b0", "encoder_weights": "imagenet",
-            "input_processing": "sincos", "augmentation_strength": "strong",
+            "run_id_suffix": "AUTO_GENERATED", # Referenčný z úspešného behu (alebo veľmi blízky)
+            "encoder_name": "resnet34", "encoder_weights": "imagenet",
+            "input_processing": "direct_minmax", "augmentation_strength": "medium",
             "loss_type": "mae_gdl", "lambda_gdl": 0.1,
-            "lr": 1e-4, "bs": 8, "epochs": 50, "es_pat": 17, "sch_pat": 7
+            "lr": 1e-3, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 10
         },
         {
-            "run_id_suffix": "R34_sincos_MAE_GDL0.2_AugStrong",
-            "encoder_name": "mobilenet_v2", "encoder_weights": "imagenet",
-            "input_processing": "sincos", "augmentation_strength": "strong",
-            "loss_type": "mae_gdl", "lambda_gdl": 0.1, # Trochu silnejšia GDL
-            "lr": 1e-4, "bs": 8, "epochs": 50, "es_pat": 17, "sch_pat": 7
-        },
-        {
-            "run_id_suffix": "R34_sincos_MAEonly_AugStrong", # Kontrolný beh bez GDL
+            "run_id_suffix": "AUTO_GENERATED",
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
-            "input_processing": "sincos", "augmentation_strength": "strong",
-            "loss_type": "mae", "lambda_gdl": 0.5,
-            "lr": 1e-4, "bs": 8, "epochs": 50, "es_pat": 17, "sch_pat": 7
+            "input_processing": "direct_minmax", "augmentation_strength": "light",
+            "loss_type": "mae_gdl", "lambda_gdl": 0.1, # Trochu silnejšia GDL
+            "lr": 1e-3, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 10
+        },
+        {
+            "run_id_suffix": "AUTO_GENERATED", # Kontrolný beh bez GDL
+            "encoder_name": "resnet34", "encoder_weights": "imagenet",
+            "input_processing": "direct_minmax", "augmentation_strength": "strong",
+            "loss_type": "mae_gdl", "lambda_gdl": 0.5,
+            "lr": 1e-3, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 10
         },
 
         # --- SÉRIA 2: ResNet34, priamy wrapped vstup, ladenie GDL ---
         # (Porovnanie s sin/cos)
         {
-            "run_id_suffix": "R34_direct_MAE_GDL0.1_AugStrong",
+            "run_id_suffix": "AUTO_GENERATED",
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
             "input_processing": "direct_minmax", "augmentation_strength": "strong",
-            "loss_type": "mae_gdl", "lambda_gdl": 0.1,
-            "lr": 1e-4, "bs": 8, "epochs": 50, "es_pat": 17, "sch_pat": 7
+            "loss_type": "mae_gdl", "lambda_gdl": 0.3,
+            "lr": 1e-3, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 10
         },
         {
-            "run_id_suffix": "R34_direct_MAEonly_AugStrong", # Kontrolný beh pre priamy vstup
-            "encoder_name": "efficientnet-b0", "encoder_weights": "imagenet",
+            "run_id_suffix": "AUTO_GENERATED", # Kontrolný beh pre priamy vstup
+            "encoder_name": "resnet34", "encoder_weights": "imagenet",
             "input_processing": "direct_minmax", "augmentation_strength": "strong",
-            "loss_type": "mae", "lambda_gdl": 0.1,
-            "lr": 1e-4, "bs": 8, "epochs": 50, "es_pat": 17, "sch_pat": 7
+            "loss_type": "mae_gdl", "lambda_gdl": 0.2,
+            "lr": 1e-3, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 10
         },
 
         # --- SÉRIA 3: ResNet18 (ľahší model) pre porovnanie, s najsľubnejšou konfiguráciou ---
         # (Predpokladajme, že sin/cos s MAE+GDL(0.1) a strong aug je sľubné)
         {
-            "run_id_suffix": "R18_sincos_MAE_GDL0.1_AugStrong",
-            "encoder_name": "resnet18", "encoder_weights": "imagenet",
-            "input_processing": "sincos", "augmentation_strength": "strong",
-            "loss_type": "mae_gdl", "lambda_gdl": 0.1,
-            "lr": 1e-4, "bs": 8, "epochs": 50, "es_pat": 17, "sch_pat": 7
+            "run_id_suffix": "AUTO_GENERATED",
+            "encoder_name": "resnet34", "encoder_weights": "imagenet",
+            "input_processing": "direct_minmax", "augmentation_strength": "strong",
+            "loss_type": "mae_gdl", "lambda_gdl": 0.05,
+            "lr": 1e-4, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 10
         },
         {
-            "run_id_suffix": "R18_sincos_MAEonly_AugStrong", # Kontrola pre ResNet18
-            "encoder_name": "resnet18", "encoder_weights": "imagenet",
+            "run_id_suffix": "AUTO_GENERATED", # Kontrola pre ResNet18
+            "encoder_name": "resnet34", "encoder_weights": "imagenet",
             "input_processing": "direct_minmax", "augmentation_strength": "strong",
-            "loss_type": "mae", "lambda_gdl": 0.1,
-            "lr": 1e-4, "bs": 8, "epochs": 50, "es_pat": 17, "sch_pat": 7
+            "loss_type": "mse_gdl", "lambda_gdl": 0.1,
+            "lr": 1e-4, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 10
         },
         
         # --- SÉRIA 4: Experiment s MSE loss (ak chceme porovnať) ---
         # (Použijeme konfiguráciu, ktorá bola s MAE sľubná)
         {
-            "run_id_suffix": "R34_sincos_MSE_GDL0.1_AugStrong",
-            "encoder_name": "resnet34", "encoder_weights": "imagenet",
-            "input_processing": "sincos", "augmentation_strength": "strong",
-            "loss_type": "mse_gdl", "lambda_gdl": 0.1, # MSE + GDL
-            "lr": 1e-4, "bs": 8, "epochs": 50, "es_pat": 17, "sch_pat": 7
+            "run_id_suffix": "AUTO_GENERATED",
+            "encoder_name": "resnet34", "encoder_weights": "None",
+            "input_processing": "direct_minmax", "augmentation_strength": "strong",
+            "loss_type": "mse", "lambda_gdl": 0.1, # MSE + GDL
+            "lr": 1e-4, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 10
         },
 
         # --- SÉRIA 5: Experiment s rôznymi silami augmentácie ---
         #Alebo ak by bol underfitting (model sa neučí dobre ani tréningové dáta):
         {
-            "run_id_suffix": "R34_sincos_MAE_GDL0.1_AugMedium",
-            "encoder_name": "resnet34", "encoder_weights": "imagenet",
-            "input_processing": "sincos", "augmentation_strength": "medium",
+            "run_id_suffix": "AUTO_GENERATED",
+            "encoder_name": "resnet34", "encoder_weights": "None",
+            "input_processing": "direct_minmax", "augmentation_strength": "medium",
             "loss_type": "mae_gdl", "lambda_gdl": 0.1,
-            "lr": 1e-4, "bs": 8, "epochs": 50, "es_pat": 17, "sch_pat": 7
+            "lr": 1e-4, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 10
         },
         # --- SÉRIA 6: Experiment s inými architektúrami ---
         {
-            "run_id_suffix": "R34_sincos_MAE_GDL0.1_AugMedium",
-            "encoder_name": "efficientnet-b0", "encoder_weights": "imagenet",
-            "input_processing": "sincos", "augmentation_strength": "medium",
+            "run_id_suffix": "AUTO_GENERATED",
+            "encoder_name": "resnet34", "encoder_weights": "None",
+            "input_processing": "direct_minmax", "augmentation_strength": "light  ",
             "loss_type": "mae_gdl", "lambda_gdl": 0.1,
-            "lr": 1e-4, "bs": 8, "epochs": 50, "es_pat": 17, "sch_pat": 7
+            "lr": 1e-4, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 10
         },
     ]
 
+
     all_run_results = []
-    for cfg in experiments:
-        print(f"\n\n{'='*25} EXPERIMENT: {cfg['run_id_suffix']} {'='*25}")
-        train_ds = CustomDataset(f'split_dataset_tiff/train_dataset', # UPRAV CESTU
+    for cfg_original in experiments:
+        cfg = cfg_original.copy() # Pracujeme s kópiou, aby sme nemenili pôvodný zoznam (ak by to bolo dôležité)
+
+        # --- Dynamické generovanie run_id_suffix ---
+        encoder_short_map = {
+            "resnet34": "R34", "resnet18": "R18", "resnet50": "R50",
+            "mobilenet_v2": "MNv2", "efficientnet-b0": "EffB0",
+            # ... doplňte ďalšie podľa potreby ...
+        }
+        enc_part = encoder_short_map.get(cfg["encoder_name"], cfg["encoder_name"])
+        if cfg["encoder_weights"] is None or cfg["encoder_weights"].lower() == "none":
+            enc_part += "scratch" # Označenie, že sa trénuje od nuly
+
+        inp_proc_part = ""
+        if cfg["input_processing"] == "sincos":
+            inp_proc_part = "sincos"
+        elif cfg["input_processing"] == "direct_minmax":
+            inp_proc_part = "direct"
+        else:
+            inp_proc_part = cfg["input_processing"]
+
+        loss_part = ""
+        if "mae" in cfg["loss_type"]:
+            loss_part = "MAE"
+        elif "mse" in cfg["loss_type"]:
+            loss_part = "MSE"
+        else:
+            loss_part = cfg["loss_type"]
+
+        gdl_val = cfg.get("lambda_gdl", 0.0)
+        gdl_part = ""
+        if gdl_val > 0 and ('gdl' in cfg["loss_type"] or loss_part): # GDL pridáme len ak má zmysel
+            gdl_part = f"GDL{str(gdl_val).replace('.', 'p')}"
+        
+        aug_strength = cfg["augmentation_strength"]
+        aug_part = f"Aug{aug_strength.capitalize()}" if aug_strength else "AugNone"
+
+        # Zostavenie run_id_suffix
+        parts = [part for part in [enc_part, inp_proc_part, loss_part, gdl_part, aug_part] if part] # Odstráni prázdne časti
+        cfg['run_id_suffix'] = "_".join(parts)
+        # --- Koniec dynamického generovania ---
+
+        print(f"\n\n{'='*25} EXPERIMENT: {cfg['run_id_suffix']} (Pôvodný suffix bol: {cfg_original['run_id_suffix']}) {'='*25}")
+        
+        train_ds = CustomDataset(f'split_dataset_tiff/train_dataset',
                                  cfg["input_processing"], 
                                  (GLOBAL_WRAPPED_MIN,GLOBAL_WRAPPED_MAX) if cfg["input_processing"]=='direct_minmax' else None,
                                  (GLOBAL_UNWRAPPED_MEAN,GLOBAL_UNWRAPPED_STD), cfg["augmentation_strength"], True)
-        val_ds = CustomDataset(f'split_dataset_tiff/valid_dataset', # UPRAV CESTU
+        val_ds = CustomDataset(f'split_dataset_tiff/valid_dataset',
                                cfg["input_processing"],
                                (GLOBAL_WRAPPED_MIN,GLOBAL_WRAPPED_MAX) if cfg["input_processing"]=='direct_minmax' else None,
                                (GLOBAL_UNWRAPPED_MEAN,GLOBAL_UNWRAPPED_STD), 'none', False)
-        test_ds = CustomDataset(f'split_dataset_tiff/test_dataset', # UPRAV CESTU
+        test_ds = CustomDataset(f'split_dataset_tiff/test_dataset',
                                 cfg["input_processing"],
                                 (GLOBAL_WRAPPED_MIN,GLOBAL_WRAPPED_MAX) if cfg["input_processing"]=='direct_minmax' else None,
                                 (GLOBAL_UNWRAPPED_MEAN,GLOBAL_UNWRAPPED_STD), 'none', False)
@@ -550,8 +593,11 @@ def spusti_experimenty():
         val_loader = DataLoader(val_ds,batch_size=cfg["bs"],shuffle=False,num_workers=num_workers,collate_fn=collate_fn_skip_none,pin_memory=device.type=='cuda')
         test_loader = DataLoader(test_ds,batch_size=cfg["bs"],shuffle=False,num_workers=num_workers,collate_fn=collate_fn_skip_none,pin_memory=device.type=='cuda')
         
+        # run_id_final teraz používa dynamicky generovaný cfg['run_id_suffix']
+        # a GDL časť je už v ňom, takže ju nemusíme pridávať znova
         run_id_final = f"{cfg['run_id_suffix']}_bs{cfg['bs']}"
-        if 'gdl' in cfg['loss_type'] and cfg.get("lambda_gdl",0.0) > 0 : run_id_final+=f"_Lgdl{str(cfg['lambda_gdl']).replace('.','p')}"
+        # Pôvodné pridávanie GDL do run_id_final už nie je potrebné, lebo je v suffixe
+        # if 'gdl' in cfg['loss_type'] and cfg.get("lambda_gdl",0.0) > 0 : run_id_final+=f"_Lgdl{str(cfg['lambda_gdl']).replace('.','p')}
         
         exp_results = run_training_session(
             run_id=run_id_final, device=device, num_epochs=cfg["epochs"],
@@ -561,7 +607,7 @@ def spusti_experimenty():
             encoder_name=cfg["encoder_name"], encoder_weights=cfg["encoder_weights"],
             input_processing_type=cfg["input_processing"], loss_type=cfg["loss_type"],
             lambda_gdl=cfg.get("lambda_gdl",0.0), learning_rate=cfg["lr"], weight_decay=1e-4,
-            scheduler_patience=cfg["sch_pat"], scheduler_factor=0.1, min_lr=1e-7,
+            scheduler_patience=cfg["sch_pat"], scheduler_factor=0.1 , min_lr=1e-7,
             early_stopping_patience=cfg["es_pat"], augmentation_strength=cfg["augmentation_strength"]
         )
         all_run_results.append({"run_id": run_id_final, "config": cfg, "metrics": exp_results})
