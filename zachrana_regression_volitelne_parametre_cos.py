@@ -282,7 +282,9 @@ def run_training_session(
     run_id, device, num_epochs, train_loader, val_loader, test_loader,
     target_original_mean, target_original_std, input_original_min_max,
     encoder_name, encoder_weights, input_processing_type, loss_type, lambda_gdl,
-    learning_rate, weight_decay, scheduler_patience, scheduler_factor, min_lr,
+    learning_rate, weight_decay, # Odstránené: scheduler_patience, scheduler_factor
+    cosine_T_max, cosine_eta_min, # Pridané pre CosineAnnealingLR
+    min_lr, # min_lr sa teraz použije pre cosine_eta_min, ak nie je špecifikované inak
     early_stopping_patience, augmentation_strength ):
     
     config_save_path = f'config_{run_id}.txt'
@@ -295,7 +297,10 @@ def run_training_session(
         "Loss Type": loss_type, "Lambda GDL": lambda_gdl if 'gdl' in loss_type else "N/A",
         "Initial LR": learning_rate, "Batch Size": train_loader.batch_size, 
         "Num Epochs": num_epochs, "Weight Decay": weight_decay,
-        "Scheduler Patience": scheduler_patience, "Scheduler Factor": scheduler_factor, "Min LR": min_lr,
+        # Odstránené: "Scheduler Patience", "Scheduler Factor"
+        "Scheduler Type": "CosineAnnealingLR",
+        "CosineAnnealingLR T_max": cosine_T_max,
+        "CosineAnnealingLR eta_min": cosine_eta_min,
         "EarlyStopping Patience": early_stopping_patience, "Device": str(device),
     }
     if input_processing_type == 'direct_minmax' and input_original_min_max:
@@ -311,8 +316,11 @@ def run_training_session(
     net = smp.Unet(encoder_name=encoder_name, encoder_weights=encoder_weights,
                    in_channels=in_channels, classes=1, activation=None).to(device)
     optimizer = optim.Adam(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=scheduler_factor, 
-                                                     patience=scheduler_patience, verbose=True, min_lr=min_lr)
+    # Nahradenie ReduceLROnPlateau za CosineAnnealingLR
+    # Ak cosine_eta_min nie je explicitne nastavené v cfg, použijeme min_lr z pôvodnej konfigurácie
+    effective_eta_min = cosine_eta_min if cosine_eta_min is not None else min_lr 
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cosine_T_max, eta_min=effective_eta_min)
+
     train_loss_hist, val_loss_hist, train_mae_denorm_hist, val_mae_denorm_hist = [],[],[],[]
     best_val_mae_denorm, epochs_no_improve = float('inf'), 0
     weights_path = f'best_weights_{run_id}.pth'
@@ -370,8 +378,9 @@ def run_training_session(
         elif not np.isnan(avg_val_mae_d):
             epochs_no_improve += 1; print(f"  Val MAE(D) not improved for {epochs_no_improve} epochs.")
         if epochs_no_improve >= early_stopping_patience: print(f"Early stopping @ epoch {epoch+1}."); break
-        if isinstance(scheduler,torch.optim.lr_scheduler.ReduceLROnPlateau) and not np.isnan(avg_val_mae_d): scheduler.step(avg_val_mae_d)
-        elif not isinstance(scheduler,torch.optim.lr_scheduler.ReduceLROnPlateau): scheduler.step()
+        
+        # scheduler.step() sa volá bez ohľadu na metriku pre CosineAnnealingLR
+        scheduler.step()
 
     print(f"Training of {run_id} done. Best Val MAE(D): {best_val_mae_denorm:.4f} @ {weights_path}")
     
@@ -442,30 +451,34 @@ def spusti_experimenty():
             "run_id_suffix": "AUTO_GENERATED",
             "encoder_name": "resnet34", "encoder_weights": "imagenet",  
             "input_processing": "direct_minmax", "augmentation_strength": "light",
-            "loss_type": "mae_gdl", "lambda_gdl": 0.1, # Trochu silnejšia GDL
-            "lr": 1e-3, "bs": 8, "epochs": 50, "es_pat": 50, "sch_pat": 7
+            "loss_type": "mae_gdl", "lambda_gdl": 0.1, 
+            "lr": 1e-3, "bs": 8, "epochs": 50, "es_pat": 50, # sch_pat odstránené
+            "cosine_T_max": 50, "cosine_eta_min": 1e-7 # Pridané parametre pre CosineAnnealingLR
         },
         {
-            "run_id_suffix": "AUTO_GENERATED", # Dynamicky generované run_id
+            "run_id_suffix": "AUTO_GENERATED", 
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
             "input_processing": "direct_minmax", "augmentation_strength": "strong",
-            "loss_type": "mae_gdl", "lambda_gdl": 0.1, # Nízka GDL
-            "lr": 1e-3, "bs": 8, "epochs": 50, "es_pat": 50, "sch_pat": 7
+            "loss_type": "mae_gdl", "lambda_gdl": 0.1, 
+            "lr": 1e-3, "bs": 8, "epochs": 50, "es_pat": 10,
+            "cosine_T_max": 50, "cosine_eta_min": 1e-7
         },
         {
-            "run_id_suffix": "AUTO_GENERATED", # Referenčný z úspešného behu (alebo veľmi blízky)
+            "run_id_suffix": "AUTO_GENERATED", 
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
             "input_processing": "direct_minmax", "augmentation_strength": "medium",
             "loss_type": "mae_gdl", "lambda_gdl": 0.1,
-            "lr": 1e-3, "bs": 8, "epochs": 50, "es_pat": 50, "sch_pat": 7 
+            "lr": 1e-3, "bs": 8, "epochs": 50, "es_pat": 10,
+            "cosine_T_max": 25, "cosine_eta_min": 5e-8 # Iné hodnoty pre ukážku
         },
    
         {
-            "run_id_suffix": "AUTO_GENERATED", # Kontrolný beh bez GDL n 
+            "run_id_suffix": "AUTO_GENERATED", 
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
             "input_processing": "direct_minmax", "augmentation_strength": "strong",
             "loss_type": "mae_gdl", "lambda_gdl": 0.5,
-            "lr": 1e-3, "bs": 8, "epochs": 50, "es_pat": 50, "sch_pat": 7
+            "lr": 1e-3, "bs": 8, "epochs": 50, "es_pat": 10,
+            "cosine_T_max": 50, "cosine_eta_min": 1e-7
         },
 
         # --- SÉRIA 2: ResNet34, priamy wrapped vstup, ladenie GDL ---
@@ -475,49 +488,48 @@ def spusti_experimenty():
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
             "input_processing": "direct_minmax", "augmentation_strength": "strong",
             "loss_type": "mae_gdl", "lambda_gdl": 0.3,
-            "lr": 1e-3, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 8
+            "lr": 1e-3, "bs": 8, "epochs": 80, "es_pat": 15,
+            "cosine_T_max": 80, "cosine_eta_min": 1e-7
         },
         {
-            "run_id_suffix": "AUTO_GENERATED", # Kontrolný beh pre priamy vstup
+            "run_id_suffix": "AUTO_GENERATED", 
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
             "input_processing": "direct_minmax", "augmentation_strength": "strong",
             "loss_type": "mae_gdl", "lambda_gdl": 0.3,
-            "lr": 1e-4, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 8
+            "lr": 1e-4, "bs": 8, "epochs": 80, "es_pat": 15,
+            "cosine_T_max": 80, "cosine_eta_min": 1e-8 
         },
-
-        # # --- SÉRIA 3: ResNet18 (ľahší model) pre porovnanie, s najsľubnejšou konfiguráciou ---
-        # # (Predpokladajme, že sin/cos s MAE+GDL(0.1) a strong aug je sľubné)
         {
             "run_id_suffix": "AUTO_GENERATED",
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
             "input_processing": "direct_minmax", "augmentation_strength": "light",
             "loss_type": "mae_gdl", "lambda_gdl": 0.3,
-            "lr": 1e-4, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 8
+            "lr": 1e-4, "bs": 8, "epochs": 80, "es_pat": 15,
+            "cosine_T_max": 40, "cosine_eta_min": 1e-7 # T_max môže byť menšie ako epochs
         },
-
-        # --- SÉRIA 5: Experiment s rôznymi silami augmentácie ---
-        #Alebo ak by bol underfitting (model sa neučí dobre ani tréningové dáta):
         {
             "run_id_suffix": "AUTO_GENERATED",
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
             "input_processing": "direct_minmax", "augmentation_strength": "strong",
             "loss_type": "mae_gdl", "lambda_gdl": 0.5,
-            "lr": 1e-4, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 8
+            "lr": 1e-4, "bs": 8, "epochs": 80, "es_pat": 15,
+            "cosine_T_max": 80, "cosine_eta_min": 0 # eta_min môže byť 0
         },
-        # --- SÉRIA 6: Experiment s inými architektúrami ---
         {
             "run_id_suffix": "AUTO_GENERATED",
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
             "input_processing": "direct_minmax", "augmentation_strength": "strong",
             "loss_type": "mae_gdl", "lambda_gdl": 0.1,
-            "lr": 1e-4, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 8
+            "lr": 1e-4, "bs": 8, "epochs": 80, "es_pat": 15,
+            "cosine_T_max": 80, "cosine_eta_min": 1e-7
         },
         {
             "run_id_suffix": "AUTO_GENERATED",
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
             "input_processing": "direct_minmax", "augmentation_strength": "light",
             "loss_type": "mae_gdl", "lambda_gdl": 0.3,
-            "lr": 1e-3, "bs": 8, "epochs": 80, "es_pat": 50, "sch_pat": 8
+            "lr": 1e-3, "bs": 8, "epochs": 80, "es_pat": 15,
+            "cosine_T_max": 80, "cosine_eta_min": 1e-7
         },
     ]
 
@@ -573,10 +585,22 @@ def spusti_experimenty():
         # Pridanie ďalších parametrov do suffixu
         epochs_part = f"Ep{cfg['epochs']}"
         es_pat_part = f"ESp{cfg['es_pat']}"
-        sch_pat_part = f"SCHp{cfg['sch_pat']}"
+        # sch_pat_part odstránené
+
+        # Nové časti pre CosineAnnealingLR
+        cosine_T_max_part = f"Tmax{cfg['cosine_T_max']}"
+        # Pre cosine_eta_min, ak je None alebo veľmi malé, môžeme použiť špeciálny formát
+        eta_min_val = cfg.get('cosine_eta_min') 
+        if eta_min_val is None: # Ak nie je definované, použije sa min_lr z run_training_session
+            cosine_eta_min_part = "EtaMinDef" # Default
+        elif eta_min_val == 0:
+            cosine_eta_min_part = "EtaMin0"
+        else:
+            cosine_eta_min_part = f"EtaMin{eta_min_val:.0e}".replace('-', 'm')
+
 
         # Zostavenie run_id_suffix
-        parts = [part for part in [enc_part, inp_proc_part, loss_part, gdl_part, aug_part, lr_part, epochs_part, es_pat_part, sch_pat_part] if part] 
+        parts = [part for part in [enc_part, inp_proc_part, loss_part, gdl_part, aug_part, lr_part, epochs_part, es_pat_part, cosine_T_max_part, cosine_eta_min_part] if part] 
         cfg['run_id_suffix'] = "_".join(parts)
         # --- Koniec dynamického generovania ---
 
@@ -612,8 +636,11 @@ def spusti_experimenty():
             input_original_min_max=(GLOBAL_WRAPPED_MIN,GLOBAL_WRAPPED_MAX) if cfg["input_processing"]=='direct_minmax' else None,
             encoder_name=cfg["encoder_name"], encoder_weights=cfg["encoder_weights"],
             input_processing_type=cfg["input_processing"], loss_type=cfg["loss_type"],
-            lambda_gdl=cfg.get("lambda_gdl",0.0), learning_rate=cfg["lr"], weight_decay=1e-4,
-            scheduler_patience=cfg["sch_pat"], scheduler_factor=0.1 , min_lr=1e-7,
+            lambda_gdl=cfg.get("lambda_gdl",0.0), learning_rate=cfg["lr"], weight_decay=1e-4, # weight_decay je tu napevno, zvážte pridanie do cfg
+            # Odstránené: scheduler_patience=cfg["sch_pat"], scheduler_factor=0.1 , 
+            cosine_T_max=cfg["cosine_T_max"], 
+            cosine_eta_min=cfg.get("cosine_eta_min"), # .get() pre prípad, že by nebol definovaný
+            min_lr=1e-7, # Ponechané pre prípad, že by cosine_eta_min nebol v cfg
             early_stopping_patience=cfg["es_pat"], augmentation_strength=cfg["augmentation_strength"]
         )
         all_run_results.append({"run_id": run_id_final, "config": cfg, "metrics": exp_results})
