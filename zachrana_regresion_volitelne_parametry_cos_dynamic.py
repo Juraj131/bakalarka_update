@@ -517,7 +517,7 @@ def run_training_session(
             epochs_no_improve += 1; print(f"  Val MAE(D) not improved for {epochs_no_improve} epochs.")
         if epochs_no_improve >= early_stopping_patience: print(f"Early stopping @ epoch {epoch+1}."); break
         
-        scheduler.step()
+        scheduler.step()     
 
     print(f"Training of {run_id} done. Best Val MAE(D): {best_val_mae_denorm:.4f} @ {weights_path}")
     
@@ -686,12 +686,66 @@ def spusti_experimenty_s_dynamickym_treningom():
 
     # --- DEFINÍCIA EXPERIMENTOV (zostáva rovnaká ako vo vašom tréningovom skripte) ---
     experiments = [
+        # {
+        #     "run_id_suffix": "AUTO_GENERATED", 
+        #     "encoder_name": "resnet34", "encoder_weights": "imagenet",  
+        #     "input_processing": "direct_minmax", "augmentation_strength": "light", 
+        #     "loss_type": "mae_gdl", "lambda_gdl": 0.1, 
+        #     "lr": 1e-3, "bs": 8, "epochs": 120, "es_pat": 30, 
+        #     "cosine_T_max": 120, "cosine_eta_min": 1e-7,
+        #     "wd": 1e-4
+        # },
+        # {
+        #     "run_id_suffix": "AUTO_GENERATED",
+        #     "encoder_name": "resnet34", "encoder_weights": "imagenet",
+        #     "input_processing": "direct_minmax", "augmentation_strength": "strong", 
+        #     "loss_type": "mae_gdl", "lambda_gdl": 0.1, 
+        #     "lr": 1e-3, "bs": 8, "epochs": 120, "es_pat": 30,
+        #     "cosine_T_max": 120, "cosine_eta_min": 1e-7,
+        #     "wd": 1e-4
+        # },
+        # {
+        #     "run_id_suffix": "AUTO_GENERATED",
+        #     "encoder_name": "resnet34", "encoder_weights": "imagenet",
+        #     "input_processing": "direct_minmax", "augmentation_strength": "medium", 
+        #     "loss_type": "mae_gdl", "lambda_gdl": 0.1, 
+        #     "lr": 1e-3, "bs": 8, "epochs": 120, "es_pat": 30,
+        #     "cosine_T_max": 120, "cosine_eta_min": 1e-7,
+        #     "wd": 1e-4
+        # },
+        # {
+        #     "run_id_suffix": "AUTO_GENERATED",
+        #     "encoder_name": "resnet34", "encoder_weights": "imagenet",
+        #     "input_processing": "direct_minmax", "augmentation_strength": "medium", 
+        #     "loss_type": "mae_gdl", "lambda_gdl": 0.3, 
+        #     "lr": 1e-3, "bs": 8, "epochs": 120, "es_pat": 30,
+        #     "cosine_T_max": 120, "cosine_eta_min": 1e-7,        
+        #     "wd": 1e-4
+        # },
         {
-            "run_id_suffix": "AUTO_GENERATED", 
-            "encoder_name": "resnet34", "encoder_weights": "imagenet",  
-            "input_processing": "direct_minmax", "augmentation_strength": "light", 
-            "loss_type": "mae_gdl", "lambda_gdl": 0.1, 
-            "lr": 1e-3, "bs": 8, "epochs": 120, "es_pat": 30, 
+            "run_id_suffix": "AUTO_GENERATED",
+            "encoder_name": "resnet34", "encoder_weights": "imagenet",
+            "input_processing": "direct_minmax", "augmentation_strength": "strong", 
+            "loss_type": "mae_gdl", "lambda_gdl": 0.3, 
+            "lr": 1e-3, "bs": 8, "epochs": 120, "es_pat": 30,
+            "cosine_T_max": 120, "cosine_eta_min": 1e-7,
+            "wd": 1e-4
+        },
+        {
+            "run_id_suffix": "AUTO_GENERATED",
+            "encoder_name": "resnet34", "encoder_weights": "imagenet",
+            "input_processing": "direct_minmax", "augmentation_strength": "medium", 
+            "loss_type": "mae_gdl", "lambda_gdl": 0.3, 
+            "lr": 5e-4, "bs": 8, "epochs": 120, "es_pat": 30,
+            "cosine_T_max": 120, "cosine_eta_min": 1e-7,
+            "wd": 1e-4
+        },
+        {
+            "run_id_suffix": "AUTO_GENERATED",
+            "encoder_name": "resnet34", "encoder_weights": "imagenet",
+            "input_processing": "direct_minmax", "augmentation_strength": "strong", 
+            "loss_type": "mae_gdl", "lambda_gdl": 0.3, 
+            "lr": 5e-4, "bs": 8, "epochs": 120, "es_pat": 30,
             "cosine_T_max": 120, "cosine_eta_min": 1e-7,
             "wd": 1e-4
         },
@@ -700,33 +754,6 @@ def spusti_experimenty_s_dynamickym_treningom():
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
             "input_processing": "direct_minmax", "augmentation_strength": "strong", 
             "loss_type": "mae_gdl", "lambda_gdl": 0.1, 
-            "lr": 1e-3, "bs": 8, "epochs": 120, "es_pat": 30,
-            "cosine_T_max": 120, "cosine_eta_min": 1e-7,
-            "wd": 1e-4
-        },
-        {
-            "run_id_suffix": "AUTO_GENERATED",
-            "encoder_name": "resnet34", "encoder_weights": "imagenet",
-            "input_processing": "direct_minmax", "augmentation_strength": "medium", 
-            "loss_type": "mae_gdl", "lambda_gdl": 0.1, 
-            "lr": 1e-3, "bs": 8, "epochs": 120, "es_pat": 30,
-            "cosine_T_max": 120, "cosine_eta_min": 1e-7,
-            "wd": 1e-4
-        },
-        {
-            "run_id_suffix": "AUTO_GENERATED",
-            "encoder_name": "resnet34", "encoder_weights": "imagenet",
-            "input_processing": "direct_minmax", "augmentation_strength": "light", 
-            "loss_type": "mae_gdl", "lambda_gdl": 0.3, 
-            "lr": 1e-3, "bs": 8, "epochs": 120, "es_pat": 30,
-            "cosine_T_max": 120, "cosine_eta_min": 1e-7,
-            "wd": 1e-4
-        },
-        {
-            "run_id_suffix": "AUTO_GENERATED",
-            "encoder_name": "resnet34", "encoder_weights": "imagenet",
-            "input_processing": "direct_minmax", "augmentation_strength": "light", 
-            "loss_type": "mae_gdl", "lambda_gdl": 0.1, 
             "lr": 5e-4, "bs": 8, "epochs": 120, "es_pat": 30,
             "cosine_T_max": 120, "cosine_eta_min": 1e-7,
             "wd": 1e-4
@@ -735,33 +762,6 @@ def spusti_experimenty_s_dynamickym_treningom():
             "run_id_suffix": "AUTO_GENERATED",
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
             "input_processing": "direct_minmax", "augmentation_strength": "medium", 
-            "loss_type": "mae_gdl", "lambda_gdl": 0.1, 
-            "lr": 5e-4, "bs": 8, "epochs": 120, "es_pat": 30,
-            "cosine_T_max": 120, "cosine_eta_min": 1e-7,
-            "wd": 1e-4
-        },
-        {
-            "run_id_suffix": "AUTO_GENERATED",
-            "encoder_name": "resnet34", "encoder_weights": "imagenet",
-            "input_processing": "direct_minmax", "augmentation_strength": "medium", 
-            "loss_type": "mae_gdl", "lambda_gdl": 0.3, 
-            "lr": 5e-4, "bs": 8, "epochs": 120, "es_pat": 30,
-            "cosine_T_max": 120, "cosine_eta_min": 1e-7,
-            "wd": 1e-4
-        },
-        {
-            "run_id_suffix": "AUTO_GENERATED",
-            "encoder_name": "resnet34", "encoder_weights": "imagenet",
-            "input_processing": "direct_minmax", "augmentation_strength": "none", 
-            "loss_type": "mae_gdl", "lambda_gdl": 0.1, 
-            "lr": 5e-4, "bs": 8, "epochs": 120, "es_pat": 30,
-            "cosine_T_max": 120, "cosine_eta_min": 1e-7,
-            "wd": 1e-4
-        },
-        {
-            "run_id_suffix": "AUTO_GENERATED",
-            "encoder_name": "resnet34", "encoder_weights": "imagenet",
-            "input_processing": "direct_minmax", "augmentation_strength": "light", 
             "loss_type": "mae_gdl", "lambda_gdl": 0.5, 
             "lr": 1e-3, "bs": 8, "epochs": 120, "es_pat": 30,
             "cosine_T_max": 120, "cosine_eta_min": 1e-7,
