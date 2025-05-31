@@ -12,19 +12,96 @@ import tifffile as tiff
 import matplotlib.pyplot as plt
 import torchvision.transforms.v2 as T 
 import segmentation_models_pytorch as smp
+from skimage import io # Pre DynamicTrainWrapCountDataset
+from skimage.filters import gaussian # Pre simulačnú funkciu
 
 # --- Globálne Konštanty ---
-KMAX = 6 # Maximálny počet |2pi| skokov na klasifikáciu
-NUM_CLASSES = 2 * KMAX + 1  # Počet tried pre k-labely (napr. 13 pre KMAX=6)
-
-# Hodnoty pre augmentácie pre vstup normalizovaný na [-1, 1]
+KMAX_DEFAULT = 6 
 NORMALIZED_INPUT_CLAMP_MIN = -1.0
 NORMALIZED_INPUT_CLAMP_MAX = 1.0
 NORMALIZED_INPUT_ERASING_VALUE = 0.0 
 
-# --- Štatistické Funkcie ---
+# --- Funkcie pre Dynamickú Simuláciu (z regresného skriptu) ---
+def get_random_or_fixed(param_value, is_integer=False, allow_float_for_int=False):
+    if isinstance(param_value, (list, tuple)) and len(param_value) == 2:
+        min_val, max_val = param_value
+        if min_val > max_val: min_val, max_val = max_val, min_val # Oprava poradia
+        if is_integer:
+            low, high = int(round(min_val)), int(round(max_val))
+            if high < low: high = low
+            return int(np.random.randint(low, high + 1))
+        else:
+            return np.random.uniform(min_val, max_val)
+    return param_value
+
+def wrap_phase(img):
+    return (img + np.pi) % (2 * np.pi) - np.pi
+
+def generate_cubic_background(shape, coeff_stats, scale=1.0, amplify_ab=1.0, n_strips=6, tilt_angle_deg=0.0):
+    H, W = shape
+    y_idxs, x_idxs = np.indices((H, W))
+    slope_y = (n_strips * 2 * np.pi) / H
+    tilt_angle_rad = np.deg2rad(tilt_angle_deg)
+    slope_x = slope_y * np.tan(tilt_angle_rad)
+    linear_grad = slope_y * y_idxs + slope_x * x_idxs
+    x_norm = np.linspace(0, 1, W)
+    a_val = np.random.normal(coeff_stats[0][0], coeff_stats[0][1] * scale)
+    b_val = np.random.normal(coeff_stats[1][0], coeff_stats[1][1] * scale)
+    c_val = np.random.normal(coeff_stats[2][0], coeff_stats[2][1] * scale)
+    d_val = np.random.normal(coeff_stats[3][0], coeff_stats[3][1] * scale)
+    a_val *= amplify_ab; b_val *= amplify_ab
+    poly1d = a_val * x_norm**3 + b_val * x_norm**2 + c_val * x_norm + d_val
+    poly2d = np.tile(poly1d, (H, 1))
+    background = linear_grad + poly2d
+    return background, dict(a=a_val, b=b_val, c=c_val, d=d_val, n_strips_actual=n_strips,
+                            slope_y=slope_y, slope_x=slope_x, tilt_angle_deg=tilt_angle_deg)
+
+def generate_simulation_pair_from_source_np_for_training(
+    source_image_np, param_ranges_config, amplify_ab_value
+):
+    n_strips = get_random_or_fixed(param_ranges_config["n_strips_param"], is_integer=True, allow_float_for_int=True)
+    original_image_influence = get_random_or_fixed(param_ranges_config["original_image_influence_param"])
+    phase_noise_std = get_random_or_fixed(param_ranges_config["phase_noise_std_param"])
+    smooth_original_image_sigma = get_random_or_fixed(param_ranges_config["smooth_original_image_sigma_param"])
+    poly_scale = get_random_or_fixed(param_ranges_config["poly_scale_param"])
+    CURVATURE_AMPLITUDE = get_random_or_fixed(param_ranges_config["CURVATURE_AMPLITUDE_param"])
+    background_d_offset = get_random_or_fixed(param_ranges_config["background_offset_d_param"])
+    tilt_angle_deg = get_random_or_fixed(param_ranges_config["tilt_angle_deg_param"])
+
+    coeff_stats_for_bg_generation = [
+        (0.0, 0.3 * CURVATURE_AMPLITUDE),
+        (-4.0 * CURVATURE_AMPLITUDE, 0.3 * CURVATURE_AMPLITUDE),
+        (+4.0 * CURVATURE_AMPLITUDE, 0.3 * CURVATURE_AMPLITUDE),
+        (background_d_offset, 2.0) 
+    ]
+    if smooth_original_image_sigma > 0 and original_image_influence > 0:
+        img_phase_obj_base = gaussian(source_image_np, sigma=smooth_original_image_sigma, preserve_range=True, channel_axis=None)
+    else:
+        img_phase_obj_base = source_image_np
+    object_phase_contribution = img_phase_obj_base * (2 * np.pi)
+    generated_background, _ = generate_cubic_background(
+        source_image_np.shape, coeff_stats_for_bg_generation, 
+        scale=poly_scale, amplify_ab=amplify_ab_value, 
+        n_strips=n_strips, tilt_angle_deg=tilt_angle_deg
+    )
+    unwrapped_phase = (object_phase_contribution * original_image_influence) + \
+                      (generated_background * (1.0 - original_image_influence))
+    if phase_noise_std > 0:
+        unwrapped_phase += np.random.normal(0, phase_noise_std, size=source_image_np.shape)
+    wrapped_phase = wrap_phase(unwrapped_phase)
+    return unwrapped_phase.astype(np.float32), wrapped_phase.astype(np.float32)
+# --- Koniec Simulačných Funkcií ---
+
+# --- Pomocná funkcia pre denormalizáciu ---
+def denormalize_input_minmax_from_minus_one_one(data_norm_minus_one_one, original_min, original_max):
+    if not isinstance(data_norm_minus_one_one, torch.Tensor):
+        data_norm_minus_one_one = torch.tensor(data_norm_minus_one_one)
+    if original_max == original_min:
+        return torch.full_like(data_norm_minus_one_one, original_min)
+    return (data_norm_minus_one_one + 1.0) * (original_max - original_min) / 2.0 + original_min
+
+# --- Štatistické Funkcie (get_input_min_max_stats - ak by boli potrebné pre statické dáta) ---
 def get_input_min_max_stats(file_list, data_type_name="Input Data"):
-    # ... (bez zmeny z predchádzajúceho multifunkčného kódu) ...
     if not file_list: raise ValueError(f"Prázdny zoznam súborov pre {data_type_name}.")
     min_val_g, max_val_g = np.inf, -np.inf
     print(f"Počítam Min/Max pre {data_type_name} z {len(file_list)} súborov...")
@@ -40,7 +117,6 @@ def get_input_min_max_stats(file_list, data_type_name="Input Data"):
 
 # --- Augmentačná Trieda ---
 class AddGaussianNoiseTransform(nn.Module):
-    # ... (bez zmeny) ...
     def __init__(self, std_dev_range=(0.03, 0.12), p=0.5, clamp_min=None, clamp_max=None):
         super().__init__()
         self.std_dev_min, self.std_dev_max = std_dev_range
@@ -56,80 +132,173 @@ class AddGaussianNoiseTransform(nn.Module):
             return noisy_img
         return img_tensor
 
-# --- Kontrola Integrity ---
+# --- Kontrola Integrity (pre statické datasety) ---
 def check_dataset_integrity(dataset_path):
-    # ... (bez zmeny) ...
     images_dir = os.path.join(dataset_path, 'images')
     labels_dir = os.path.join(dataset_path, 'labels')
+    if not os.path.exists(images_dir): print(f"VAROVANIE: Adresár s obrázkami {images_dir} nebol nájdený."); return
+    if not os.path.exists(labels_dir): print(f"VAROVANIE: Adresár s labelmi {labels_dir} nebol nájdený."); return
+    
     image_files = sorted(glob.glob(os.path.join(images_dir, "*.tiff")))
-    if not os.path.exists(labels_dir): raise FileNotFoundError(f"Adresár s labelmi {labels_dir} nebol nájdený.")
+    if not image_files: print(f"VAROVANIE: Nenašli sa žiadne TIFF obrázky v {images_dir}."); return
+
+    missing_labels = 0
     for image_file in image_files:
         label_file_name = os.path.basename(image_file).replace('wrappedbg', 'unwrapped')
         expected_label_path = os.path.join(labels_dir, label_file_name)
         if not os.path.exists(expected_label_path):
-            alternative_label_path = image_file.replace('images', 'labels').replace('wrappedbg', 'unwrapped')
-            if not os.path.exists(alternative_label_path):
-                raise FileNotFoundError(f"Label pre obrázok {image_file} nebola nájdená.")
-    print(f"Dataset {dataset_path} je v poriadku.")
+            missing_labels +=1
+            print(f"  Chýbajúci label: {expected_label_path} pre obrázok {image_file}")
+    if missing_labels == 0: print(f"Dataset {dataset_path} je v poriadku (kontrola názvov súborov).")
+    else: print(f"Dataset {dataset_path} má {missing_labels} chýbajúcich labelov.")
 
-# --- Dataset pre Klasifikáciu Wrap Count ---
+
+# --- Statický Dataset (pre validáciu a testovanie) ---
 class WrapCountDataset(Dataset):
     def __init__(self, path_to_data, 
-                 input_min_max, # (min,max) pre normalizáciu wrapped vstupu
-                 k_max_val=KMAX,
-                 augment_strength='none', # 'none', 'light', 'medium', 'strong'
-                 is_train_set=False,
-                 target_img_size=(512,512)):
+                 input_min_max_global, 
+                 k_max_val=KMAX_DEFAULT,
+                 target_img_size=(512,512),
+                 edge_loss_weight=3.0): # Nový parameter pre váhu hrán
         self.path = path_to_data
         self.image_list = sorted(glob.glob(os.path.join(self.path, 'images', "*.tiff")))
-        self.input_min, self.input_max = input_min_max
+        self.input_min_g, self.input_max_g = input_min_max_global
         self.k_max = k_max_val
-        self.is_train_set = is_train_set
         self.target_img_size = target_img_size
-        self.augment_strength = augment_strength
+        self.edge_loss_weight = edge_loss_weight # Uloženie váhy
+
+        self.geometric_transforms = None # Statický dataset zvyčajne bez augmentácií
+        self.pixel_transforms_for_input = None
+
+    def _normalize_input_minmax_to_minus_one_one(self, data, min_val, max_val):
+        if max_val == min_val: return torch.zeros_like(data)
+        return 2.0 * (data - min_val) / (max_val - min_val) - 1.0
+
+    def _ensure_shape_and_type(self, img_numpy, target_shape, data_name="Image", dtype=np.float32):
+        img_numpy = img_numpy.astype(dtype)
+        current_shape = img_numpy.shape[-2:]
+        if current_shape != target_shape:
+            h, w = current_shape; target_h, target_w = target_shape
+            pad_h = max(0, target_h - h); pad_w = max(0, target_w - w)
+            if pad_h > 0 or pad_w > 0:
+                pad_top, pad_bottom = pad_h // 2, pad_h - (pad_h // 2)
+                pad_left, pad_right = pad_w // 2, pad_w - (pad_w // 2)
+                if img_numpy.ndim == 2: img_numpy = np.pad(img_numpy, ((pad_top, pad_bottom), (pad_left, pad_right)), mode='reflect')
+                elif img_numpy.ndim == 3 and img_numpy.shape[0] == 1: img_numpy = np.pad(img_numpy, ((0,0), (pad_top, pad_bottom), (pad_left, pad_right)), mode='reflect')
+                else: raise ValueError(f"Nepodporovaný tvar pre padding: {img_numpy.shape}")
+            h, w = img_numpy.shape[-2:]
+            if h > target_h or w > target_w:
+                start_h, start_w = (h - target_h) // 2, (w - target_w) // 2
+                if img_numpy.ndim == 2: img_numpy = img_numpy[start_h:start_h+target_h, start_w:start_w+target_w]
+                elif img_numpy.ndim == 3 and img_numpy.shape[0] == 1: img_numpy = img_numpy[:, start_h:start_h+target_h, start_w:start_w+target_w]
+                else: raise ValueError(f"Nepodporovaný tvar pre cropping: {img_numpy.shape}")
+            if img_numpy.shape[-2:] != target_shape:
+                  raise ValueError(f"{data_name} '{getattr(self, 'current_img_path_for_debug', 'N/A')}' po úprave tvaru {img_numpy.shape[-2:]}, očakáva sa {target_shape}")
+        return img_numpy
+
+    def __len__(self): return len(self.image_list)
+
+    def __getitem__(self, index):
+        self.current_img_path_for_debug = self.image_list[index]
+        img_path = self.image_list[index]
+        base_id_name = os.path.basename(img_path).replace('wrappedbg_', '').replace('.tiff','')
+        lbl_path = os.path.join(os.path.dirname(os.path.dirname(img_path)), 'labels', f'unwrapped_{base_id_name}.tiff')
+        
+        try:
+            wrapped_orig_np = tiff.imread(img_path) 
+            unwrapped_orig_np = tiff.imread(lbl_path)
+        except Exception as e: 
+            print(f"CHYBA načítania statického páru: {img_path} alebo {lbl_path}. Error: {e}")
+            return None,None,None,None,None # Pridaná piata None hodnota
+
+        wrapped_orig_np = self._ensure_shape_and_type(wrapped_orig_np, self.target_img_size, "Wrapped phase (static)")
+        unwrapped_orig_np = self._ensure_shape_and_type(unwrapped_orig_np, self.target_img_size, "Unwrapped phase (static)")
+
+        wrapped_tensor = torch.from_numpy(wrapped_orig_np.copy()).unsqueeze(0) 
+        unwrapped_tensor = torch.from_numpy(unwrapped_orig_np.copy()).unsqueeze(0)
+
+        diff = (unwrapped_tensor - wrapped_tensor) / (2 * np.pi)
+        k_float = torch.round(diff)
+        k_float = torch.clamp(k_float, -self.k_max, self.k_max)
+        k_label = (k_float + self.k_max).long().squeeze(0) # Tensor (H,W)
+
+        wrapped_input_norm = self._normalize_input_minmax_to_minus_one_one(wrapped_tensor.squeeze(0), self.input_min_g, self.input_max_g).unsqueeze(0)
+        
+        # Generovanie weight map
+        k_label_np = k_label.cpu().numpy() 
+        edge_mask = np.zeros_like(k_label_np, dtype=bool)
+        # Horizontálne rozdiely
+        edge_mask[:, :-1] |= (k_label_np[:, :-1] != k_label_np[:, 1:])
+        edge_mask[:, 1:] |= (k_label_np[:, 1:] != k_label_np[:, :-1]) 
+        # Vertikálne rozdiely
+        edge_mask[:-1, :] |= (k_label_np[:-1, :] != k_label_np[1:, :])
+        edge_mask[1:, :] |= (k_label_np[1:, :] != k_label_np[:-1, :]) 
+        
+        weight_map_np = np.ones_like(k_label_np, dtype=np.float32)
+        weight_map_np[edge_mask] = self.edge_loss_weight # Použitie uloženej váhy
+        weight_map_tensor = torch.from_numpy(weight_map_np)
+
+        return wrapped_input_norm, k_label, unwrapped_tensor.squeeze(0), wrapped_tensor.squeeze(0), weight_map_tensor
+
+
+# --- Dynamický Dataset pre Tréning Klasifikácie ---
+class DynamicTrainWrapCountDataset(Dataset):
+    def __init__(self, 
+                 source_image_filepaths,
+                 simulation_param_ranges,
+                 amplify_ab_fixed_value,
+                 input_min_max_global, 
+                 k_max_val=KMAX_DEFAULT,
+                 augmentation_strength='none',
+                 target_img_size=(512,512),
+                 edge_loss_weight=3.0): # Nový parameter
+        
+        self.source_image_filepaths = source_image_filepaths
+        self.simulation_param_ranges = simulation_param_ranges
+        self.amplify_ab_fixed_value = amplify_ab_fixed_value
+        self.input_min_g, self.input_max_g = input_min_max_global
+        self.k_max = k_max_val
+        self.augmentation_strength = augmentation_strength
+        self.target_img_size = target_img_size
+        self.edge_loss_weight = edge_loss_weight # Uloženie váhy
 
         self.geometric_transforms = None
-        self.pixel_transforms_for_input = None # Len pre wrapped vstup
-
-        if self.is_train_set and self.augment_strength != 'none':
-            self._setup_augmentations(self.augment_strength)
+        self.pixel_transforms_for_input = None
+        if self.augmentation_strength != 'none':
+            self._setup_augmentations(self.augmentation_strength)
 
     def _setup_augmentations(self, strength):
-        # ... (definície p_affine, deg_affine, atď. zostávajú rovnaké) ...
+        # Zjednodušené augmentácie pre klasifikáciu, podobné ako v WrapCountDataset
+        # ale s parametrami z regresného skriptu pre konzistenciu
         p_affine, deg_affine, trans_affine, scale_affine, shear_affine = 0.0, (-5,5), (0.05,0.05), (0.95,1.05), (-3,3)
-        noise_std_range, noise_p = (0.01, 0.05), 0.0
-        erase_scale, erase_p = (0.01, 0.04), 0.0
-        blur_sigma, blur_p = (0.1, 1.0), 0.0
-
+        noise_std_range, noise_p = (0.01, 0.05), 0.0 # Pre normalizovaný vstup [-1,1]
+        erase_scale, erase_p = (0.01, 0.04), 0.0    # Pre normalizovaný vstup [-1,1]
+        # GaussianBlur sa tu nepoužíva, aby sme sa vyhli skimage v Dataset triede pre jednoduchosť
+        
         if strength == 'light':
-            p_affine = 0.3
-            noise_std_range, noise_p = (0.02, 0.08), 0.3
-            erase_scale, erase_p = (0.01, 0.05), 0.2
-            blur_sigma, blur_p = (0.1, 1.0), 0.2
+            p_affine = 0.3 # Pravdepodobnosť pre RandomAffine, ak by sa použilo
+            noise_std_range, noise_p = (0.02, 0.08), 0.4 # Z regresného skriptu
+            erase_scale, erase_p = (0.01, 0.05), 0.3    # Z regresného skriptu
         elif strength == 'medium':
-            p_affine = 0.5; deg_affine,trans_affine,scale_affine,shear_affine = (-10,10),(0.08,0.08),(0.9,1.1),(-5,5)
+            p_affine = 0.5
             noise_std_range, noise_p = (0.03, 0.12), 0.5
             erase_scale, erase_p = (0.02, 0.08), 0.4
-            blur_sigma, blur_p = (0.1, 1.8), 0.4
         elif strength == 'strong':
-            p_affine = 0.6; deg_affine,trans_affine,scale_affine,shear_affine = (-12,12),(0.1,0.1),(0.85,1.15),(-7,7)
+            p_affine = 0.6
             noise_std_range, noise_p = (0.05, 0.15), 0.6
             erase_scale, erase_p = (0.02, 0.10), 0.5
-            blur_sigma, blur_p = (0.1, 2.5), 0.5
         
-        geo_transforms_list = [T.RandomHorizontalFlip(p=0.5)] # RandomHorizontalFlip má parameter 'p'
-        if p_affine > 0:
-            # Pre wrapped vstup (1 kanál) normalizovaný na [-1,1], fill=0.0 je stred
-            # Ak by si používal sin/cos (2 kanály), fill by mal byť [0.0, 0.0]
-            # V tomto klasifikačnom kóde je vstup 1-kanálový (normalizovaný wrapped)
-        #     affine_transform = T.RandomAffine(degrees=deg_affine, translate=trans_affine, 
-        #                                       scale=scale_affine, shear=shear_affine, 
-        #                                       fill=0.0) # fill pre jednokanálový vstup
-        #     # Obalíme RandomAffine do RandomApply
-        #     geo_transforms_list.append(T.RandomApply([affine_transform], p=p_affine))
-            
-        # self.geometric_transforms = T.Compose(geo_transforms_list)
-            pass
+        geo_transforms_list = []
+        if strength in ['light', 'medium', 'strong']: # Vždy pridáme aspoň flip
+             geo_transforms_list.append(T.RandomHorizontalFlip(p=0.5))
+        # Ak by ste chceli pridať RandomAffine:
+        # if p_affine > 0:
+        #     geo_transforms_list.append(T.RandomAffine(
+        #         degrees=deg_affine, translate=trans_affine, 
+        #         scale=scale_affine, shear=shear_affine, p=p_affine
+        #     ))
+        if geo_transforms_list:
+            self.geometric_transforms = T.Compose(geo_transforms_list)
         
         pixel_aug_list = []
         if noise_p > 0:
@@ -139,78 +308,93 @@ class WrapCountDataset(Dataset):
         if erase_p > 0:
             pixel_aug_list.append(T.RandomErasing(p=erase_p, scale=erase_scale, ratio=(0.3, 3.3), 
                                 value=NORMALIZED_INPUT_ERASING_VALUE, inplace=False))
-        if blur_p > 0:
-            # k_size = 3 if isinstance(blur_sigma, float) and blur_sigma <= 1.0 else 5 
-            # pixel_aug_list.append(T.RandomApply([
-            #         T.GaussianBlur(kernel_size=k_size, sigma=blur_sigma)
-            #     ], p=blur_p))
-            pass
-        
-        if pixel_aug_list: self.pixel_transforms_for_input = T.Compose(pixel_aug_list)
-        else: self.pixel_transforms_for_input = T.Compose([])
+        if pixel_aug_list:
+            self.pixel_transforms_for_input = T.Compose(pixel_aug_list)
+
 
     def _normalize_input_minmax_to_minus_one_one(self, data, min_val, max_val):
         if max_val == min_val: return torch.zeros_like(data)
         return 2.0 * (data - min_val) / (max_val - min_val) - 1.0
 
-    def _ensure_shape_and_type(self, img_numpy, target_shape, data_name="Image", dtype=np.float32):
-        # ... (rovnaká robustná implementácia ako predtým) ...
-        img_numpy = img_numpy.astype(dtype) 
-        if img_numpy.shape[-2:] != target_shape:
-            raise ValueError(f"{data_name} '{getattr(self, 'current_img_path_for_debug', 'N/A')}' má tvar {img_numpy.shape}, očakáva sa H,W ako {target_shape}")
-        return img_numpy
+    def __len__(self):
+        return len(self.source_image_filepaths) # Alebo iná logika, ak chcete viac epoch cez menej zdrojov
 
-    def __len__(self): return len(self.image_list)
-
-    def __getitem__(self, index):
-        self.current_img_path_for_debug = self.image_list[index]
-        img_path, lbl_path = self.image_list[index], self.image_list[index].replace('images','labels').replace('wrappedbg','unwrapped')
+    def __getitem__(self, idx):
+        source_img_path = self.source_image_filepaths[idx % len(self.source_image_filepaths)]
         try:
-            wrapped_orig = tiff.imread(img_path) 
-            unwrapped_orig = tiff.imread(lbl_path)
-        except Exception as e: print(f"CHYBA načítania: {img_path} alebo {lbl_path}. Error: {e}"); return None,None,None
+            source_img_raw = io.imread(source_img_path).astype(np.float32)
+            if source_img_raw.shape != self.target_img_size:
+                 print(f"VAROVANIE: Zdrojový obrázok {source_img_path} má tvar {source_img_raw.shape}, očakáva sa {self.target_img_size}. Skúsim resize.")
+                 source_img_raw_tensor = torch.from_numpy(source_img_raw).unsqueeze(0).unsqueeze(0)
+                 source_img_raw_tensor = F.interpolate(source_img_raw_tensor, size=self.target_img_size, mode='bilinear', align_corners=False)
+                 source_img_raw = source_img_raw_tensor.squeeze(0).squeeze(0).numpy()
+        except Exception as e:
+            print(f"CHYBA načítania zdrojového obrázka: {source_img_path}. Error: {e}"); 
+            return None, None, None, None, None # Pridaná piata None hodnota
 
-        wrapped_orig = self._ensure_shape_and_type(wrapped_orig, self.target_img_size, "Wrapped phase")
-        unwrapped_orig = self._ensure_shape_and_type(unwrapped_orig, self.target_img_size, "Unwrapped phase")
+        img_min_val, img_max_val = source_img_raw.min(), source_img_raw.max()
+        source_img_norm_for_sim = (source_img_raw - img_min_val) / (img_max_val - img_min_val) if img_max_val > img_min_val else np.zeros_like(source_img_raw)
+        
+        unwrapped_phase_np, wrapped_phase_np = generate_simulation_pair_from_source_np_for_training(
+            source_img_norm_for_sim, self.simulation_param_ranges, self.amplify_ab_fixed_value
+        )
 
-        wrapped_tensor = torch.from_numpy(wrapped_orig.copy()).unsqueeze(0) # (1, H, W)
-        unwrapped_tensor = torch.from_numpy(unwrapped_orig.copy()).unsqueeze(0) # (1, H, W)
+        wrapped_tensor_orig_geo_aug = torch.from_numpy(wrapped_phase_np.copy()).unsqueeze(0) 
+        unwrapped_tensor_orig_geo_aug = torch.from_numpy(unwrapped_phase_np.copy()).unsqueeze(0)
 
-        # Aplikácia geometrických augmentácií na oba tenzory PRED výpočtom k-labelov
-        if self.is_train_set and self.augment_strength != 'none' and self.geometric_transforms:
-            # Pre konzistentnú transformáciu ich stackneme (ak by transformácie nezvládali tuple priamo)
-            # Alebo ak sú transformácie v T.Compose([....]) z v2, mali by zvládnuť tuple
-            wrapped_tensor, unwrapped_tensor = self.geometric_transforms(wrapped_tensor, unwrapped_tensor)
+        if self.geometric_transforms:
+            # Geometrické augmentácie sa aplikujú na wrapped aj unwrapped pred výpočtom k_label
+            # a pred výpočtom weight_map, aby weight_map zodpovedala augmentovaným k_labelom
+            stacked_phases = torch.cat((wrapped_tensor_orig_geo_aug, unwrapped_tensor_orig_geo_aug), dim=0) # (2, H, W)
+            stacked_phases_aug = self.geometric_transforms(stacked_phases)
+            wrapped_tensor_orig_geo_aug, unwrapped_tensor_orig_geo_aug = stacked_phases_aug[0:1], stacked_phases_aug[1:2]
 
-        # Výpočet k-labelov z (potenciálne augmentovaných) wrapped a unwrapped
-        diff = (unwrapped_tensor - wrapped_tensor) / (2 * np.pi)
+
+        diff = (unwrapped_tensor_orig_geo_aug - wrapped_tensor_orig_geo_aug) / (2 * np.pi)
         k_float = torch.round(diff)
         k_float = torch.clamp(k_float, -self.k_max, self.k_max)
-        # Výsledný k_label bude (H,W) a typu long pre CrossEntropy
-        k_label = (k_float + self.k_max).long().squeeze(0) 
+        k_label = (k_float + self.k_max).long().squeeze(0) # Tensor (H,W)
 
-        # Normalizácia wrapped vstupu (teraz už môže byť augmentovaný geometricky)
-        # .squeeze(0) a .unsqueeze(0) aby sme normalizovali 2D dáta a vrátili 3D
-        wrapped_input_norm = self._normalize_input_minmax_to_minus_one_one(wrapped_tensor.squeeze(0), self.input_min, self.input_max).unsqueeze(0)
+        wrapped_input_norm = self._normalize_input_minmax_to_minus_one_one(
+            wrapped_tensor_orig_geo_aug.squeeze(0), self.input_min_g, self.input_max_g
+        ).unsqueeze(0) 
 
-        # Aplikácia pixel-wise augmentácií len na normalizovaný wrapped vstup
-        if self.is_train_set and self.augment_strength != 'none' and self.pixel_transforms_for_input:
+        if self.pixel_transforms_for_input:
             wrapped_input_norm = self.pixel_transforms_for_input(wrapped_input_norm)
-        
-        # unwrapped_tensor sa vracia pre výpočet finálnych MAE/MSE na denormalizovaných dátach
-        return wrapped_input_norm, k_label, unwrapped_tensor.squeeze(0) # Vstup (1,H,W), k_label (H,W), unwrapped (H,W)
 
-# Koláčová funkcia - upravená pre 3 výstupy z datasetu
+        # Generovanie weight map z (potenciálne geometricky augmentovaných) k_label
+        k_label_np = k_label.cpu().numpy()
+        edge_mask = np.zeros_like(k_label_np, dtype=bool)
+        edge_mask[:, :-1] |= (k_label_np[:, :-1] != k_label_np[:, 1:])
+        edge_mask[:, 1:] |= (k_label_np[:, 1:] != k_label_np[:, :-1]) 
+        edge_mask[:-1, :] |= (k_label_np[:-1, :] != k_label_np[1:, :])
+        edge_mask[1:, :] |= (k_label_np[1:, :] != k_label_np[:-1, :]) 
+        
+        weight_map_np = np.ones_like(k_label_np, dtype=np.float32)
+        weight_map_np[edge_mask] = self.edge_loss_weight
+        weight_map_tensor = torch.from_numpy(weight_map_np)
+        
+        return wrapped_input_norm, k_label, unwrapped_tensor_orig_geo_aug.squeeze(0), wrapped_tensor_orig_geo_aug.squeeze(0), weight_map_tensor
+
+
+# --- Collate Function ---
 def collate_fn_skip_none_classification(batch):
-    batch = list(filter(lambda x: x[0] is not None and x[1] is not None and x[2] is not None, batch))
-    if not batch: return None, None, None
+    # Filter out samples where any of the first 5 elements is None
+    batch = list(filter(lambda x: all(item is not None for item in x[:5]), batch))
+    if not batch: return None, None, None, None, None # Vráti 5 None hodnôt
     return torch.utils.data.dataloader.default_collate(batch)
 
 # --- Loss Funkcie a Metriky pre Klasifikáciu ---
-def cross_entropy_loss_full(logits, klabels): # Bez maskovania, ak už nemáme padding
-    return F.cross_entropy(logits, klabels) # logits (B,C,H,W), klabels (B,H,W)
+def cross_entropy_loss_full(logits, klabels, weight_map=None): # Pridaný weight_map
+    # logits (B,C,H,W), klabels (B,H,W), weight_map (B,H,W)
+    pixel_losses = F.cross_entropy(logits, klabels, reduction='none') 
+    if weight_map is not None:
+        weighted_losses = pixel_losses * weight_map
+        return torch.mean(weighted_losses)
+    else:
+        return torch.mean(pixel_losses) # Fallback, ak weight_map nie je poskytnutá
 
-def k_label_accuracy_full(logits, klabels): # Bez maskovania
+def k_label_accuracy_full(logits, klabels):
     pred_classes = torch.argmax(logits, dim=1) # (B,H,W)
     correct = (pred_classes == klabels).float().sum() # Počet správnych pixelov
     total = klabels.numel() # Celkový počet pixelov
@@ -219,29 +403,32 @@ def k_label_accuracy_full(logits, klabels): # Bez maskovania
 # --- Tréningová Slučka pre Klasifikáciu ---
 def run_classification_training_session(
     run_id, device, num_epochs, train_loader, val_loader, test_loader,
-    input_min_max, # Pre info do configu, nepoužíva sa na denormalizáciu (len unwrapped)
-    # Model
+    input_min_max_for_denorm, 
     encoder_name, encoder_weights, k_max_val,
-    # Optimizer a Scheduler
-    learning_rate, weight_decay, scheduler_patience, scheduler_factor, min_lr,
-    # Early Stopping
+    learning_rate, weight_decay, 
+    cosine_T_max, cosine_eta_min,
     early_stopping_patience,
-    # Augmentácie
-    augmentation_strength
+    augmentation_strength, 
+    train_data_source_type,
+    edge_loss_weight_value 
     ):
 
     config_save_path = f'config_clf_{run_id}.txt'
-    # ... (uloženie configu podobne ako predtým, pridaj k_max_val) ...
+    num_classes_effective = 2 * k_max_val + 1
     config_details = {
         "Run ID": run_id, "Timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "Task Type": "Classification (Wrap Count)",
+        "Task Type": "Classification (Wrap Count) + Reconstruction MAE",
         "Encoder Name": encoder_name, "Encoder Weights": encoder_weights,
-        "K_MAX": k_max_val, "NUM_CLASSES": 2 * k_max_val + 1,
-        "Input Normalization": f"MinMax to [-1,1] (Min: {input_min_max[0]:.2f}, Max: {input_min_max[1]:.2f})",
-        "Augmentation Strength": augmentation_strength,
-        "Initial LR": learning_rate, "Batch Size": train_loader.batch_size, 
+        "K_MAX": k_max_val, "NUM_CLASSES": num_classes_effective,
+        "Input Normalization (Global MinMax for Wrapped)": f"Min: {input_min_max_for_denorm[0]:.4f}, Max: {input_min_max_for_denorm[1]:.4f}",
+        "Train Data Source": train_data_source_type,
+        "Train Augmentation Strength": augmentation_strength,
+        "Edge Loss Weight": edge_loss_weight_value, 
+        "Initial LR": learning_rate, "Batch Size": train_loader.batch_size if train_loader else "N/A", 
         "Num Epochs": num_epochs, "Weight Decay": weight_decay,
-        "Scheduler Patience": scheduler_patience, "Scheduler Factor": scheduler_factor, "Min LR": min_lr,
+        "Scheduler Type": "CosineAnnealingLR", 
+        "CosineAnnealingLR T_max": cosine_T_max, 
+        "CosineAnnealingLR eta_min": cosine_eta_min, 
         "EarlyStopping Patience": early_stopping_patience, "Device": str(device),
     }
     with open(config_save_path, 'w') as f:
@@ -249,278 +436,541 @@ def run_classification_training_session(
                 "\n".join([f"{k}: {v}" for k,v in config_details.items()]) + "\n")
     print(f"Konfigurácia klasifikačného experimentu uložená do: {config_save_path}")
 
-
-    num_classes_effective = 2 * k_max_val + 1
     net = smp.Unet(encoder_name=encoder_name, encoder_weights=encoder_weights,
-                   in_channels=1, classes=num_classes_effective, activation=None).to(device) # Výstup sú logity
+                   in_channels=1, classes=num_classes_effective, activation=None).to(device)
 
     optimizer = optim.Adam(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', # Chceme maximalizovať Val k-label Accuracy
-                                                     factor=scheduler_factor, patience=scheduler_patience, 
-                                                     verbose=True, min_lr=min_lr)
+    # Pôvodný scheduler:
+    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', 
+    #                                                  factor=scheduler_factor, patience=scheduler_patience, 
+    #                                                  verbose=True, min_lr=min_lr)
+    # Nový CosineAnnealingLR scheduler:
+    # effective_eta_min sa nastaví v spusti_experimenty_klasifikacia pri volaní tejto funkcie
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cosine_T_max, eta_min=cosine_eta_min)
+
     
     train_ce_loss_hist, val_ce_loss_hist = [], []
     train_k_acc_hist, val_k_acc_hist = [], []
-    # Pre sledovanie finálnej MAE na unwrapped fáze
-    train_final_mae_hist, val_final_mae_hist = [], []
+    val_mae_hist = [] 
 
-
-    best_val_k_accuracy = 0.0 # Chceme maximalizovať
-    weights_path = f'best_weights_clf_{run_id}.pth'
-    epochs_no_improve = 0
+    best_val_k_accuracy = 0.0
+    best_val_mae = float('inf') # Nižšie MAE je lepšie
+    weights_path = f'best_weights_clf_{run_id}.pth' # Ukladá sa model s najlepšou k-Acc
+    
+    epochs_no_k_acc_improve = 0
+    epochs_no_mae_improve = 0
+    
     print(f"Starting CLASSIFICATION training for {run_id}...")
 
+    epoch_viz_main_dir = f"epoch_visualizations_clf_{run_id}"
+    os.makedirs(epoch_viz_main_dir, exist_ok=True)
+
     for epoch in range(num_epochs):
-        start_time = time.time() # Začiatok merania času epochy
+        start_time = time.time()
         net.train()
-        epoch_train_ce, epoch_train_k_acc, epoch_train_final_mae = [], [], []
+        epoch_train_ce, epoch_train_k_acc = [], []
         for batch_data in train_loader:
-            if batch_data[0] is None: continue
-            wrapped_norm, k_labels, unwrapped_gt_orig = batch_data # unwrapped_gt_orig je nenormalizovaný
-            wrapped_norm, k_labels = wrapped_norm.to(device), k_labels.to(device)
-            unwrapped_gt_orig = unwrapped_gt_orig.to(device) # Pre výpočet finálnej MAE
+            # batch_data teraz obsahuje 5 položiek
+            if batch_data[0] is None: continue 
+            wrapped_norm, k_labels_gt, _, _, weight_maps = batch_data # Rozbalenie 5 položiek
+            
+            wrapped_norm, k_labels_gt = wrapped_norm.to(device), k_labels_gt.to(device)
+            weight_maps = weight_maps.to(device) # Presun váh na device
 
             optimizer.zero_grad()
-            logits = net(wrapped_norm) # (B, NUM_CLASSES, H, W)
-            
-            loss = cross_entropy_loss_full(logits, k_labels)
+            logits = net(wrapped_norm)
+            loss = cross_entropy_loss_full(logits, k_labels_gt, weight_maps) # Použitie váh
             loss.backward(); optimizer.step()
             
             with torch.no_grad():
-                acc = k_label_accuracy_full(logits, k_labels)
-                # Rekonštrukcia pre finálnu MAE
-                pred_classes = torch.argmax(logits, dim=1) # (B,H,W)
-                k_pred_values = pred_classes.float() - k_max_val # (-k_max .. +k_max)
-                # wrapped_norm je (B,1,H,W), unwrapped_gt_orig je (B,H,W)
-                # Potrebujeme denormalizovať wrapped_norm, aby sme ho mohli použiť na rekonštrukciu
-                # Ak je wrapped_norm už [-1,1] z [-pi,pi], tak wrapped_orig = (wrapped_norm+1)/2 * 2pi - pi
-                # Alebo jednoduchšie, použiť wrapped_orig z datasetu, ak by sme ho vracali
-                # Pre jednoduchosť teraz predpokladáme, že wrapped_norm je to, čo by sme použili
-                # s tým, že k_pred_values sú už v správnych jednotkách (násobky 2pi)
-                # Ak wrapped_norm je [-1,1] z pôvodného wrapped_phase, tak wrapped_phase = (wrapped_norm + 1)/2 * (max_in-min_in) + min_in
-                # Toto je komplikovanejšie, jednoduchšie je vrátiť wrapped_orig z datasetu pre MAE.
-                # Nateraz, pre ilustráciu, použijeme wrapped_norm, ale je to NESPRÁVNE pre presnú MAE.
-                # Potrebovali by sme pôvodný wrapped_orig (nenormalizovaný) z datasetu.
-                # Pre finálnu MAE by mal CustomDataset vracať aj pôvodný wrapped_orig.
-                # Nateraz to preskočíme a zameriame sa na k-label accuracy.
-                # Ak by sme chceli presnú MAE, museli by sme upraviť CustomDataset.
-                # Alternatíva: vypočítať MAE na k-labeloch * 2pi (čo nie je presne to isté)
-                # mae_on_k_times_2pi = torch.mean(torch.abs(k_pred_values - (k_labels.float() - k_max_val))) * (2 * np.pi)
-                # epoch_train_final_mae.append(mae_on_k_times_2pi.item())
-                # Tu ponecháme len k_acc a CE loss pre tréning
-                
+                acc = k_label_accuracy_full(logits, k_labels_gt)
             epoch_train_ce.append(loss.item())
             epoch_train_k_acc.append(acc.item())
         
-        # ... (podobná logika pre validáciu - výpočet CE, k_acc a prípadne rekonštrukcia pre MAE)
-        # ... (printy, scheduler, early stopping - riadené podľa val_k_acc_hist[-1])
-
-        # Nasledujúci kód je veľmi zjednodušený pre validáciu, treba ho doplniť
         avg_train_ce = np.mean(epoch_train_ce) if epoch_train_ce else float('nan')
         avg_train_k_acc = np.mean(epoch_train_k_acc) if epoch_train_k_acc else float('nan')
         train_ce_loss_hist.append(avg_train_ce)
         train_k_acc_hist.append(avg_train_k_acc)
 
-        # Validácia - zjednodušená
         net.eval()
-        epoch_val_ce, epoch_val_k_acc = [],[]
+        epoch_val_ce, epoch_val_k_acc, epoch_val_mae = [],[],[] 
+        visualized_this_epoch = False 
         with torch.no_grad():
-            for batch_data in val_loader:
-                if batch_data[0] is None: continue
-                wrapped_norm, k_labels, _ = batch_data
-                wrapped_norm, k_labels = wrapped_norm.to(device), k_labels.to(device)
-                logits = net(wrapped_norm)
-                epoch_val_ce.append(cross_entropy_loss_full(logits, k_labels).item())
-                epoch_val_k_acc.append(k_label_accuracy_full(logits, k_labels).item())
+            for val_batch_idx, batch_data_val in enumerate(val_loader): 
+                if batch_data_val[0] is None: continue
+                
+                wrapped_norm_val, k_labels_gt_val, unwrapped_gt_orig_val, wrapped_orig_val, weight_maps_val = batch_data_val
+                
+                wrapped_norm_val = wrapped_norm_val.to(device)
+                k_labels_gt_val = k_labels_gt_val.to(device)
+                weight_maps_val = weight_maps_val.to(device)
+                unwrapped_gt_orig_val = unwrapped_gt_orig_val.to(device) 
+                wrapped_orig_val = wrapped_orig_val.to(device) 
+
+
+                logits_val = net(wrapped_norm_val)
+                
+                epoch_val_ce.append(cross_entropy_loss_full(logits_val, k_labels_gt_val, weight_maps_val).item())
+                epoch_val_k_acc.append(k_label_accuracy_full(logits_val, k_labels_gt_val).item())
+
+                pred_classes_val = torch.argmax(logits_val, dim=1) 
+                k_pred_values_val = pred_classes_val.float() - k_max_val 
+                unwrapped_pred_reconstructed_val = wrapped_orig_val + (2 * np.pi) * k_pred_values_val
+                mae_denorm_val = torch.mean(torch.abs(unwrapped_pred_reconstructed_val - unwrapped_gt_orig_val))
+                epoch_val_mae.append(mae_denorm_val.item())
+                
+                if val_batch_idx == 0 and not visualized_this_epoch and len(wrapped_orig_val) > 0:
+                    pred_classes_val_viz = torch.argmax(logits_val, dim=1) 
+                    j = 0 
+                    wrapped_display_val = wrapped_orig_val[j].cpu().numpy().squeeze()
+                    k_labels_gt_display_val = k_labels_gt_val[j].cpu().numpy().squeeze()
+                    pred_classes_display_val = pred_classes_val_viz[j].cpu().numpy().squeeze()
+
+                    fig_epoch_k, axes_epoch_k = plt.subplots(1, 3, figsize=(18, 6))
+                    fig_epoch_k.suptitle(f"Val. k-triedy - {run_id} - Epocha {epoch+1}", fontsize=16)
+                    
+                    im0_val = axes_epoch_k[0].imshow(wrapped_display_val, cmap='gray')
+                    axes_epoch_k[0].set_title(f"Vstup Wrapped (orig.)", fontsize=14)
+                    fig_epoch_k.colorbar(im0_val, ax=axes_epoch_k[0])
+                    
+                    im1_val = axes_epoch_k[1].imshow(k_labels_gt_display_val, cmap='viridis', vmin=0, vmax=num_classes_effective-1)
+                    axes_epoch_k[1].set_title(f"GT k-triedy (0 až {num_classes_effective-1})", fontsize=14)
+                    fig_epoch_k.colorbar(im1_val, ax=axes_epoch_k[1])
+                    
+                    im2_val = axes_epoch_k[2].imshow(pred_classes_display_val, cmap='viridis', vmin=0, vmax=num_classes_effective-1)
+                    axes_epoch_k[2].set_title(f"Predikované k-triedy (0 až {num_classes_effective-1})", fontsize=14)
+                    fig_epoch_k.colorbar(im2_val, ax=axes_epoch_k[2])
+                    
+                    plt.tight_layout(rect=[0,0,1,0.95])
+                    plt.savefig(os.path.join(epoch_viz_main_dir, f'val_k_labels_ep{epoch+1}.png'))
+                    plt.close(fig_epoch_k)
+                    visualized_this_epoch = True 
         
         avg_val_ce = np.mean(epoch_val_ce) if epoch_val_ce else float('nan')
         avg_val_k_acc = np.mean(epoch_val_k_acc) if epoch_val_k_acc else float('nan')
+        avg_val_mae = np.mean(epoch_val_mae) if epoch_val_mae else float('nan') 
+        
         val_ce_loss_hist.append(avg_val_ce)
         val_k_acc_hist.append(avg_val_k_acc)
+        val_mae_hist.append(avg_val_mae) 
 
-        # Výpočet času trvania epochy
-        end_time = time.time()
-        epoch_duration = end_time - start_time
+        epoch_duration = time.time() - start_time
+        print(f"Run: {run_id} | Ep {epoch+1}/{num_epochs} | Tr CE: {avg_train_ce:.4f}, Tr kAcc: {avg_train_k_acc:.4f} | Val CE: {avg_val_ce:.4f}, Val kAcc: {avg_val_k_acc:.4f}, Val MAE: {avg_val_mae:.4f} | LR: {optimizer.param_groups[0]['lr']:.1e} | Time: {epoch_duration:.2f}s")
 
-        print(f"Run: {run_id} | Ep {epoch+1}/{num_epochs} | Tr CE: {avg_train_ce:.4f}, Tr kAcc: {avg_train_k_acc:.4f} | Val CE: {avg_val_ce:.4f}, Val kAcc: {avg_val_k_acc:.4f} | LR: {optimizer.param_groups[0]['lr']:.1e} | Time: {epoch_duration:.2f}s")
+        # Early stopping logika
+        k_acc_improved = False
+        mae_improved = False
 
-        current_val_metric = avg_val_k_acc # Monitorujeme k-label accuracy
-        if not np.isnan(current_val_metric) and current_val_metric > best_val_k_accuracy:
-            best_val_k_accuracy = current_val_metric
-            torch.save(net.state_dict(), weights_path); print(f"  New best Val k-Acc: {best_val_k_accuracy:.4f}. Saved.")
-            epochs_no_improve = 0
-        elif not np.isnan(current_val_metric):
-            epochs_no_improve += 1; print(f"  Val k-Acc not improved for {epochs_no_improve} epochs.")
-        if epochs_no_improve >= early_stopping_patience: print(f"Early stopping @ epoch {epoch+1}."); break
-        if isinstance(scheduler,torch.optim.lr_scheduler.ReduceLROnPlateau) and not np.isnan(current_val_metric): scheduler.step(current_val_metric)
-        elif not isinstance(scheduler,torch.optim.lr_scheduler.ReduceLROnPlateau): scheduler.step()
+        if not np.isnan(avg_val_k_acc) and avg_val_k_acc > best_val_k_accuracy:
+            best_val_k_accuracy = avg_val_k_acc
+            torch.save(net.state_dict(), weights_path)
+            print(f"  New best Val k-Acc: {best_val_k_accuracy:.4f} (Val MAE: {avg_val_mae:.4f}). Saved model based on k-Acc.")
+            epochs_no_k_acc_improve = 0
+            k_acc_improved = True
+        elif not np.isnan(avg_val_k_acc):
+            epochs_no_k_acc_improve += 1
+        
+        if not np.isnan(avg_val_mae) and avg_val_mae < best_val_mae:
+            best_val_mae = avg_val_mae
+            # Model sa neukladá na základe MAE, len sa sleduje najlepšia hodnota
+            print(f"  New best Val MAE: {best_val_mae:.4f} (Val k-Acc: {avg_val_k_acc:.4f}).")
+            epochs_no_mae_improve = 0
+            mae_improved = True
+        elif not np.isnan(avg_val_mae):
+            epochs_no_mae_improve += 1
+        
+        # Zastaví tréning, ak sa ani k-Acc ani MAE nezlepšili počas 'patience' epoch
+        if epochs_no_k_acc_improve >= early_stopping_patience and \
+           epochs_no_mae_improve >= early_stopping_patience:
+            print(f"Early stopping @ epoch {epoch+1}: Val k-Acc not improved for {epochs_no_k_acc_improve} epochs AND Val MAE not improved for {epochs_no_mae_improve} epochs.")
+            break
+        
+        scheduler.step() 
     
-    print(f"Training of {run_id} done. Best Val k-Acc: {best_val_k_accuracy:.4f} @ {weights_path}")
+    print(f"Training of {run_id} done. Best Val k-Acc (used for saving model): {best_val_k_accuracy:.4f}. Best Val MAE (tracked): {best_val_mae:.4f} @ {weights_path}")
 
-    # --- Testovacia Fáza pre Klasifikáciu ---
-    # (Implementuj podobne ako v tvojom pôvodnom `u_net_classification_bak.py`
-    #  s načítaním `best_weights_clf_{run_id}.pth`, rekonštrukciou unwrapped fáze
-    #  a výpočtom finálnej MAE/MSE na unwrapped dátach.
-    #  Nezabudni na vizualizácie k-labelov a rekonštruovanej fázy.)
-    # TOTO JE LEN PLACEHOLDER PRE TESTOVACIU FÁZU
     avg_test_mae_denorm = float('nan')
-    if os.path.exists(weights_path):
+    avg_test_k_acc = float('nan')
+    if os.path.exists(weights_path) and test_loader is not None:
         print(f"\nTesting with best weights for {run_id}...")
-        net.load_state_dict(torch.load(weights_path, weights_only=True))
+        net.load_state_dict(torch.load(weights_path, map_location=device))
         net.eval()
-        test_final_mae_list = []
-        test_k_acc_list_final = []
+        test_mae_list_denorm = []
+        test_k_acc_list = []
+        
+        # Mediánový filter sa už nepoužíva
+        # median_filter_size = 3 
+
         with torch.no_grad():
-            for i, batch_data in enumerate(test_loader):
-                if batch_data[0] is None: continue
-                wrapped_norm, k_labels_gt, unwrapped_gt_orig = batch_data
-                wrapped_norm, k_labels_gt, unwrapped_gt_orig = wrapped_norm.to(device), k_labels_gt.to(device), unwrapped_gt_orig.to(device)
+            for i, batch_data_test in enumerate(test_loader):
+                if batch_data_test[0] is None: continue
+                # Testovací loader tiež vracia weight_map, ale tu sa nepoužije pre MAE alebo k-acc
+                wrapped_norm_test, k_labels_gt_test, unwrapped_gt_orig_test, wrapped_orig_test, _ = batch_data_test
+                wrapped_norm_test = wrapped_norm_test.to(device)
+                k_labels_gt_test = k_labels_gt_test.to(device)
+                unwrapped_gt_orig_test = unwrapped_gt_orig_test.to(device)
+                wrapped_orig_test = wrapped_orig_test.to(device) # Toto je pôvodný wrapped, ale potenciálne geom. aug.
+
+                logits_test = net(wrapped_norm_test)
+                pred_classes_test = torch.argmax(logits_test, dim=1) # (B,H,W)
                 
-                logits = net(wrapped_norm)
-                pred_classes = torch.argmax(logits, dim=1) # (B,H,W)
-                k_pred_values = pred_classes.float() - k_max_val
+                current_k_acc = k_label_accuracy_full(logits_test, k_labels_gt_test)
+                test_k_acc_list.append(current_k_acc.item())
 
-                # Pre presnú rekonštrukciu by sme potrebovali pôvodný wrapped (nenormalizovaný)
-                # Ak ho nemáme, musíme denormalizovať wrapped_norm:
-                # wrapped_orig_for_reconstruction = (wrapped_norm * (input_min_max[1] - input_min_max[0]) + input_min_max[0] + input_min_max[1]) / 2.0 # Ak bol MinMax na [-1,1]
-                # Pre jednoduchosť teraz použijeme wrapped_norm, ale výsledná MAE nebude presne vo fyz. jednotkách bez denormalizácie wrapped
-                # Ak CustomDataset vracia wrapped_orig (nenormalizovaný), použi ten.
+                # Rekonštrukcia pre MAE
+                # wrapped_denorm_test = denormalize_input_minmax_from_minus_one_one(
+                #     wrapped_norm_test, input_min_max_for_denorm[0], input_min_max_for_denorm[1]
+                # ) # Použijeme radšej wrapped_orig_test, ktoré je už v správnej škále
+                k_pred_values_test = pred_classes_test.float() - k_max_val # (-k_max .. +k_max)
                 
-                # Aby sme to urobili správne, CustomDataset musí vracať aj pôvodný wrapped_orig
-                # Pre teraz, na ukážku, budeme MAE počítať len na k-hodnotách * 2pi, čo je aproximácia
-                # k_gt_values = k_labels_gt.float() - k_max_val
-                # mae_approx = torch.mean(torch.abs(k_pred_values - k_gt_values)) * (2 * np.pi)
-                # test_final_mae_list.append(mae_approx.item()) # Toto je len aproximácia!
+                # unwrapped_pred_reconstructed = wrapped_denorm_test.squeeze(1) + (2 * np.pi) * k_pred_values_test
+                # Použijeme wrapped_orig_test, ktoré je už (B,H,W) a v pôvodnej škále (ale augmentované)
+                unwrapped_pred_reconstructed = wrapped_orig_test + (2 * np.pi) * k_pred_values_test
 
-                # Správna rekonštrukcia (vyžaduje pôvodný wrapped, alebo denormalizovaný wrapped_norm)
-                # Pre ilustráciu, ak by sme mali pôvodný wrapped (nenormalizovaný)
-                # unwrapped_pred_reconstructed = wrapped_orig_denormalized_or_direct + (2 * np.pi) * k_pred_values
-                # final_mae_on_reconstructed = torch.mean(torch.abs(unwrapped_pred_reconstructed - unwrapped_gt_orig))
-                # test_final_mae_list.append(final_mae_on_reconstructed.item())
-                # Pre teraz, keďže CustomDataset nevracia wrapped_orig, test MAE bude len placeholder
-                
-                test_k_acc_list_final.append(k_label_accuracy_full(logits, k_labels_gt).item())
 
-                if i==0 and len(wrapped_norm)>0: # Vizualizácia
-                    j=0
-                    # ... (kód pre vizualizáciu k-labelov a rekonštruovanej fázy)
-                    # ... (podobne ako si mal v u_net_classification_bak.py)
-                    # ... (pre rekonštrukciu budeš potrebovať pôvodný wrapped alebo ho denormalizovať)
-                    pass # Placeholder pre vizualizáciu
+                mae_denorm = torch.mean(torch.abs(unwrapped_pred_reconstructed - unwrapped_gt_orig_test))
+                test_mae_list_denorm.append(mae_denorm.item())
 
-        avg_test_mae_denorm = np.mean(test_final_mae_list) if test_final_mae_list else float('nan') # Toto bude NaN, ak neimplementuješ rekonštrukciu
-        avg_test_k_acc = np.mean(test_k_acc_list_final) if test_k_acc_list_final else float('nan')
+                if i == 0 and len(wrapped_norm_test) > 0: # Vizualizácia pre prvý batch
+                    j = 0 # Prvý obrázok z batchu
+                    
+                    # Pripravíme dáta pre vizualizáciu (CPU, numpy)
+                    # wrapped_display = wrapped_denorm_test[j].cpu().numpy().squeeze()
+                    wrapped_display = wrapped_orig_test[j].cpu().numpy().squeeze()
+                    k_labels_gt_display = k_labels_gt_test[j].cpu().numpy().squeeze()
+                    pred_classes_display = pred_classes_test[j].cpu().numpy().squeeze()
+                    unwrapped_gt_display = unwrapped_gt_orig_test[j].cpu().numpy().squeeze()
+                    unwrapped_reconstructed_display = unwrapped_pred_reconstructed[j].cpu().numpy().squeeze()
+
+                    # Vizualizácia 1: k-triedy
+                    fig1, axes1 = plt.subplots(1, 3, figsize=(18, 6))
+                    fig1.suptitle(f"Vizualizácia k-tried - {run_id}", fontsize=16)
+                    
+                    im0 = axes1[0].imshow(wrapped_display, cmap='gray')
+                    axes1[0].set_title(f"Vstup Wrapped (denorm/orig.)", fontsize=14)
+                    fig1.colorbar(im0, ax=axes1[0])
+                    
+                    im1 = axes1[1].imshow(k_labels_gt_display, cmap='viridis', vmin=0, vmax=num_classes_effective-1)
+                    axes1[1].set_title(f"GT k-triedy (0 až {num_classes_effective-1})", fontsize=14)
+                    fig1.colorbar(im1, ax=axes1[1])
+                    
+                    im2 = axes1[2].imshow(pred_classes_display, cmap='viridis', vmin=0, vmax=num_classes_effective-1)
+                    axes1[2].set_title(f"Predikované k-triedy (0 až {num_classes_effective-1})", fontsize=14)
+                    fig1.colorbar(im2, ax=axes1[2])
+                    
+                    plt.tight_layout(rect=[0,0,1,0.95])
+                    plt.savefig(f'vis_clf_k_labels_{run_id}.png')
+                    plt.close(fig1)
+
+                    # Vizualizácia 2: Rekonštrukcia
+                    fig2, axes2 = plt.subplots(1, 3, figsize=(18, 6))
+                    fig2.suptitle(f"Vizualizácia rekonštrukcie fázy - {run_id}", fontsize=16)
+
+                    im3 = axes2[0].imshow(wrapped_display, cmap='gray')
+                    axes2[0].set_title(f"Vstup Wrapped (denorm/orig.)", fontsize=14)
+                    fig2.colorbar(im3, ax=axes2[0])
+
+                    im4 = axes2[1].imshow(unwrapped_gt_display, cmap='gray')
+                    axes2[1].set_title(f"GT Unwrapped Fáza", fontsize=14)
+                    fig2.colorbar(im4, ax=axes2[1])
+
+                    im5 = axes2[2].imshow(unwrapped_reconstructed_display, cmap='gray')
+                    axes2[2].set_title(f"Rekonštruovaná Unwrapped Fáza", fontsize=14)
+                    fig2.colorbar(im5, ax=axes2[2])
+
+                    plt.tight_layout(rect=[0,0,1,0.95])
+                    plt.savefig(f'vis_clf_reconstruction_{run_id}.png')
+                    plt.close(fig2)
+                    
+                    try:
+                        tiff.imwrite(f'input_wrapped_orig_test_{run_id}.tiff', wrapped_display.astype(np.float32))
+                        tiff.imwrite(f'gt_k_labels_test_{run_id}.tiff', k_labels_gt_display.astype(np.uint8))
+                        tiff.imwrite(f'pred_k_labels_test_{run_id}.tiff', pred_classes_display.astype(np.uint8))
+                        tiff.imwrite(f'gt_unwrapped_test_{run_id}.tiff', unwrapped_gt_display.astype(np.float32))
+                        tiff.imwrite(f'reconstructed_unwrapped_test_{run_id}.tiff', unwrapped_reconstructed_display.astype(np.float32))
+                    except Exception as e_tiff:
+                        print(f"Chyba pri ukladaní testovacích TIFF obrázkov: {e_tiff}")
+
+        avg_test_mae_denorm = np.mean(test_mae_list_denorm) if test_mae_list_denorm else float('nan')
+        avg_test_k_acc = np.mean(test_k_acc_list) if test_k_acc_list else float('nan')
+        
         print(f"  Test k-label Accuracy: {avg_test_k_acc:.4f}")
-        # print(f"  Approximated Test Unwrapped MAE (Denorm): {avg_test_mae_denorm:.4f}") # Ak by si rátal tú aproximáciu
+        print(f"  Test MAE (Denorm, Rekonštrukcia): {avg_test_mae_denorm:.6f}")
+        
         with open(f"metrics_clf_{run_id}.txt", "w") as f:
-            f.write(f"Run ID: {run_id}\nBest Val k-Acc: {best_val_k_accuracy:.4f}\nTest k-Acc: {avg_test_k_acc:.4f}\n")
-            # f.write(f"Approximated Test Unwrapped MAE: {avg_test_mae_denorm:.4f}\n")
+            f.write(f"Run ID: {run_id}\n")
+            f.write(f"Best Val k-Accuracy (model saved): {best_val_k_accuracy:.4f}\n")
+            f.write(f"Best Val MAE (tracked during training): {best_val_mae:.4f}\n") 
+            f.write(f"Test k-Accuracy: {avg_test_k_acc:.4f}\n")
+            f.write(f"Test MAE (Denorm, Rekonštrukcia): {avg_test_mae_denorm:.6f}\n")
     else:
-        print(f"No weights found for {run_id} to test.")
-        avg_test_mae_denorm = float('nan') # Aby sme mali čo vrátiť
+        if not os.path.exists(weights_path): print(f"No weights found for {run_id} to test.")
+        if test_loader is None: print(f"Test loader not provided for {run_id}, skipping testing.")
 
-    # Grafy pre klasifikáciu
-    plt.figure(figsize=(12,5)); plt.subplot(1,2,1)
-    plt.plot(train_ce_loss_hist,label='Train CE Loss'); plt.plot(val_ce_loss_hist,label='Val CE Loss')
-    plt.title(f'CE Loss - {run_id}'); plt.xlabel('Epoch'); plt.ylabel('CE Loss'); plt.legend(); plt.grid(True)
-    plt.subplot(1,2,2)
-    plt.plot(train_k_acc_hist,label='Train k-Acc'); plt.plot(val_k_acc_hist,label='Val k-Acc')
-    plt.title(f'k-Label Accuracy - {run_id}'); plt.xlabel('Epoch'); plt.ylabel('Accuracy'); plt.legend(); plt.grid(True)
+    plt.figure(figsize=(18,5)) 
+    plt.subplot(1,3,1) 
+    plt.plot(train_ce_loss_hist,label='Tréningová CE Loss')
+    plt.plot(val_ce_loss_hist,label='Validačná CE Loss')
+    plt.title(f'Priebeh CE Loss - {run_id}', fontsize=16); plt.xlabel('Epocha', fontsize=12); plt.ylabel('CE Loss', fontsize=12); plt.legend(); plt.grid(True)
+    
+    plt.subplot(1,3,2) 
+    plt.plot(train_k_acc_hist,label='Tréningová k-Accuracy')
+    plt.plot(val_k_acc_hist,label='Validačná k-Accuracy')
+    plt.title(f'Priebeh k-Label Accuracy - {run_id}', fontsize=16); plt.xlabel('Epocha', fontsize=12); plt.ylabel('Accuracy', fontsize=12); plt.legend(); plt.grid(True)
+
+    plt.subplot(1,3,3) 
+    plt.plot(val_mae_hist, label='Validačné MAE (Rekonštrukcia)')
+    plt.title(f'Priebeh Validačného MAE - {run_id}', fontsize=16); plt.xlabel('Epocha', fontsize=12); plt.ylabel('MAE', fontsize=12); plt.legend(); plt.grid(True)
+    
     plt.tight_layout(); plt.savefig(f'curves_clf_{run_id}.png'); plt.close()
 
-    return {"best_val_k_accuracy": best_val_k_accuracy, "test_final_mae_denorm": avg_test_mae_denorm, "test_k_accuracy": avg_test_k_acc if os.path.exists(weights_path) else float('nan')}
+    return {"best_val_k_accuracy": best_val_k_accuracy, 
+            "best_val_mae_overall": best_val_mae, 
+            "test_mae_denorm": avg_test_mae_denorm, 
+            "test_k_accuracy": avg_test_k_acc}
 
 
-# --- Hlavná Funkcia pre Spúšťanie Experimentov ---
 def spusti_experimenty_klasifikacia():
-    RUN_ID_PREFIX = "clf_wrapcount_v1" 
-    # Predpokladáme, že GLOBAL_WRAPPED_MIN/MAX sú blízko -pi/pi pre MinMax normalizáciu vstupu
-    # Ak nie, treba ich vypočítať z tréningových wrapped dát.
-    # Pre jednoduchosť teraz použijeme priamo -np.pi, np.pi
-    GLOBAL_WRAPPED_MIN, GLOBAL_WRAPPED_MAX = -np.pi, np.pi 
-    norm_input_minmax_stats = (GLOBAL_WRAPPED_MIN, GLOBAL_WRAPPED_MAX)
+    
+    GLOBAL_WRAPPED_INPUT_MIN, GLOBAL_WRAPPED_INPUT_MAX = -np.pi, np.pi 
+    norm_input_minmax_stats_global = (GLOBAL_WRAPPED_INPUT_MIN, GLOBAL_WRAPPED_INPUT_MAX)
+    print(f"Používajú sa globálne štatistiky pre wrapped vstup: Min={GLOBAL_WRAPPED_INPUT_MIN:.4f}, Max={GLOBAL_WRAPPED_INPUT_MAX:.4f}")
 
-    # Cieľové dáta (unwrapped) sa nepoužívajú na normalizáciu siete, len na výpočet k-labelov
-    # a na finálnu evaluáciu MAE/MSE na rekonštruovanej fáze.
-    # Štatistiky pre unwrapped nepotrebujeme pre `target_mean_std` v CustomDataset.
+    # --- CESTY K DATASETOM ---
+    # Pre statické valid/test dáta
+    base_static_dataset_dir = 'split_dataset_tiff' # Adresár s podadresármi train_dataset, valid_dataset, test_dataset
+    path_valid_dataset = os.path.join(base_static_dataset_dir, 'valid_dataset')
+    path_test_dataset = os.path.join(base_static_dataset_dir, 'test_dataset')
+    
+    # Pre zdrojové obrázky pre dynamický tréning
+    # Predpokladáme štruktúru z regresného skriptu:
+    output_base_dir_from_script1_reg = "split_dataset_tiff_for_dynamic_v_stratified_final" 
+    path_dynamic_train_source_images = os.path.join(output_base_dir_from_script1_reg, "train_dataset_source_for_dynamic_generation", "images")
 
-    for ds_name_part in ['train_dataset', 'valid_dataset', 'test_dataset']:
-        check_dataset_integrity(os.path.join('split_dataset_tiff', ds_name_part))
+    if not os.path.exists(path_dynamic_train_source_images):
+        raise FileNotFoundError(f"Adresár so zdrojovými obrázkami pre dynamický tréning nebol nájdený: {path_dynamic_train_source_images}")
+
+    # Kontrola integrity pre statické sady
+    for ds_path_check in [path_valid_dataset, path_test_dataset]: # Tréningový je teraz dynamický
+        if os.path.exists(ds_path_check):
+            check_dataset_integrity(ds_path_check)
+        else:
+            print(f"VAROVANIE: Adresár statického datasetu nebol nájdený: {ds_path_check}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    num_workers = 5
+    # Zosúladenie s regresným skriptom
+    num_train_data_workers = 1 # Alebo viac, ak máte viac CPU jadier
+    num_eval_data_workers = 1  # Pre valid/test
+
+    # --- Parametre simulácie (z regresného skriptu) ---
+    simulation_param_ranges_config = {
+        "n_strips_param": (7, 8), 
+        "original_image_influence_param": (0.3, 0.5),
+        "phase_noise_std_param": (0.024, 0.039),
+        "smooth_original_image_sigma_param": (0.2, 0.5),
+        "poly_scale_param": (0.02, 0.1), 
+        "CURVATURE_AMPLITUDE_param": (1.4, 2.0), 
+        "background_offset_d_param": (-24.8, -6.8), 
+        "tilt_angle_deg_param": (-5.0, 17.0) 
+    }
+    amplify_ab_fixed_config_val = 1.0 
+    # ----------------------------------------------------
     
     experiments_clf = [
         {
-            "run_id_suffix": "ResNet18_K6_AugMedium",
-            "encoder_name": "resnet18", "encoder_weights": "imagenet",
-            "k_max_val": KMAX, # Použijeme globálnu KMAX
-            "augmentation_strength": "strong", # 'none', 'light', 'medium', 'strong'
-            "lr": 1e-4, "bs": 8, "epochs": 50, 
-            "es_pat": 15, "sch_pat": 7, "sch_factor": 0.1, "min_lr": 1e-7
+            "run_id_suffix": "AUTO_GENERATED", 
+            "encoder_name": "resnet34", "encoder_weights": "imagenet",
+            "k_max_val": 6, 
+            "augmentation_strength": "medium", 
+            "lr": 1e-3, "bs": 8, "epochs": 120, "wd": 1e-4,
+            "es_pat": 30, 
+            "cosine_T_max": 120, 
+            "cosine_eta_min": 1e-7,
+            "edge_loss_weight": 3.0 # Nový parameter pre konfiguráciu
         },
-        # {
-        #     "run_id_suffix": "ResNet34_K6_AugStrong",
-        #     "encoder_name": "resnet34", "encoder_weights": "imagenet",
-        #     "k_max_val": KMAX,
-        #     "augmentation_strength": "strong",
-        #     "lr": 1e-4, "bs": 8, "epochs": 100, 
-        #     "es_pat": 20, "sch_pat": 10, "sch_factor": 0.1, "min_lr": 1e-7
-        # },
+        {
+            "run_id_suffix": "AUTO_GENERATED", 
+            "encoder_name": "resnet34", "encoder_weights": "imagenet",
+            "k_max_val": 6, 
+            "augmentation_strength": "medium", 
+            "lr": 1e-3, "bs": 8, "epochs": 120, "wd": 1e-4,
+            "es_pat": 30, 
+            "cosine_T_max": 120, 
+            "cosine_eta_min": 1e-7,
+            "edge_loss_weight": 5.0 # Rôzna váha pre iný experiment
+        },
+        {
+            "run_id_suffix": "AUTO_GENERATED", 
+            "encoder_name": "resnet34", "encoder_weights": "imagenet",
+            "k_max_val": 6, 
+            "augmentation_strength": "medium", 
+            "lr": 1e-3, "bs": 8, "epochs": 120, "wd": 1e-4,
+            "es_pat": 30, 
+            "cosine_T_max": 120, 
+            "cosine_eta_min": 1e-7,
+            "edge_loss_weight": 7.0 # Rôzna váha pre iný experiment
+        },
+        {
+            "run_id_suffix": "AUTO_GENERATED", 
+            "encoder_name": "resnet34", "encoder_weights": "imagenet",
+            "k_max_val": 6, 
+            "augmentation_strength": "medium", 
+            "lr": 1e-3, "bs": 8, "epochs": 120, "wd": 1e-4,
+            "es_pat": 30, 
+            "cosine_T_max": 120, 
+            "cosine_eta_min": 1e-7,
+            "edge_loss_weight": 9.0 # Rôzna váha pre iný experiment
+        },
     ]
 
     all_clf_results = []
-    for cfg in experiments_clf:
-        print(f"\n\n{'='*20} KLASIFIKAČNÝ EXPERIMENT: {cfg['run_id_suffix']} {'='*20}")
-        
-        # Pre klasifikáciu CustomDataset nepotrebuje target_mean_std
-        train_ds = WrapCountDataset(f'split_dataset_tiff/train_dataset',
-                                 input_min_max=norm_input_minmax_stats,
-                                 k_max_val=cfg["k_max_val"],
-                                 augment_strength=cfg["augmentation_strength"], 
-                                 is_train_set=True)
-        val_ds = WrapCountDataset(f'split_dataset_tiff/valid_dataset',
-                               input_min_max=norm_input_minmax_stats,
-                               k_max_val=cfg["k_max_val"],
-                               augment_strength='none', 
-                               is_train_set=False)
-        test_ds = WrapCountDataset(f'split_dataset_tiff/test_dataset',
-                                input_min_max=norm_input_minmax_stats,
-                                k_max_val=cfg["k_max_val"],
-                                augment_strength='none',
-                                is_train_set=False)
+    for cfg_original in experiments_clf:
+        cfg = cfg_original.copy() 
 
-        train_loader = DataLoader(train_ds,batch_size=cfg["bs"],shuffle=True,num_workers=num_workers,collate_fn=collate_fn_skip_none_classification,pin_memory=device.type=='cuda')
-        val_loader = DataLoader(val_ds,batch_size=cfg["bs"],shuffle=False,num_workers=num_workers,collate_fn=collate_fn_skip_none_classification,pin_memory=device.type=='cuda')
-        test_loader = DataLoader(test_ds,batch_size=cfg["bs"],shuffle=False,num_workers=num_workers,collate_fn=collate_fn_skip_none_classification,pin_memory=device.type=='cuda')
+        # --- Dynamické generovanie run_id_suffix (zostáva podobné) ---
+        encoder_short_map = {"resnet18": "R18", "resnet34": "R34", "resnet50": "R50",
+                             "efficientnet-b0": "EffB0", "efficientnet-b1": "EffB1"}
+        enc_name_part = encoder_short_map.get(cfg["encoder_name"], cfg["encoder_name"][:5])
+        enc_weights_part = "imgnet" if cfg["encoder_weights"] == "imagenet" else "scratch"
+        enc_part = f"{enc_name_part}{enc_weights_part}"
         
-        run_id_final = f"{cfg['run_id_suffix']}_bs{cfg['bs']}"
+        kmax_part = f"Kmax{cfg['k_max_val']}"
+        aug_part = f"Aug{cfg['augmentation_strength'][:3].capitalize()}" if cfg['augmentation_strength'] != 'none' else "AugNone"
+        lr_part = f"LR{cfg['lr']:.0e}".replace('-', 'm')
         
+        # Úprava pre bs_part pre robustnosť
+        bs_value = cfg.get('bs') 
+        bs_part = f"bs{bs_value}" if bs_value is not None else None # Ak 'bs' chýba, bs_part bude None
+
+        wd_part = f"WD{cfg['wd']:.0e}".replace('-', 'm') if cfg.get('wd',0) > 0 else "WD0"
+        epochs_part = f"Ep{cfg['epochs']}"
+        
+        # Časti pre CosineAnnealingLR scheduler
+        cosine_T_max_part = f"Tmax{cfg['cosine_T_max']}"
+        eta_min_val_cfg = cfg.get('cosine_eta_min') # Získame hodnotu z configu
+        # Fallback na malú hodnotu, ak nie je v configu, alebo ak je None
+        # Použijeme min_lr z pôvodnej konfigurácie ako default, ak cosine_eta_min nie je špecifikované
+        # Alebo si môžeme zvoliť fixný default, napr. 1e-7 alebo 0
+        effective_eta_min_for_id = eta_min_val_cfg if eta_min_val_cfg is not None else cfg.get("min_lr", 1e-7) # Fallback na min_lr alebo fixnú hodnotu
+
+        if effective_eta_min_for_id == 0:
+            cosine_eta_min_part = "EtaMin0"
+        else:
+            cosine_eta_min_part = f"EtaMin{effective_eta_min_for_id:.0e}".replace('-', 'm')
+        
+        edge_weight_part = f"EdgeW{cfg.get('edge_loss_weight', 1.0)}" # Pridanie do run_id
+
+        parts = [part for part in [enc_part, kmax_part, aug_part, lr_part, wd_part, epochs_part, cosine_T_max_part, cosine_eta_min_part, edge_weight_part, bs_part] if part]
+        generated_suffix = "_".join(parts)
+
+        if "run_id_suffix" in cfg_original and cfg_original["run_id_suffix"] != "AUTO_GENERATED":
+            run_id_final = cfg_original["run_id_suffix"]
+        else:
+            run_id_final = generated_suffix
+        cfg['run_id_final_used'] = run_id_final
+
+        print(f"\n\n{'='*20} KLASIFIKAČNÝ EXPERIMENT (DYN. TRÉNING): {run_id_final} {'='*20}")
+        
+        # --- Vytvorenie DataLoaders ---
+        source_filepaths_for_train_loader = glob.glob(os.path.join(path_dynamic_train_source_images, "*.tif*"))
+        if not source_filepaths_for_train_loader:
+            print(f"CHYBA: Nenašli sa žiadne zdrojové obrázky v {path_dynamic_train_source_images}. Preskakujem experiment {run_id_final}.")
+            all_clf_results.append({"run_id": run_id_final, "config": cfg, "metrics": {"error": "No source images for dynamic training"}})
+            continue
+            
+        train_ds = DynamicTrainWrapCountDataset(
+            source_image_filepaths=source_filepaths_for_train_loader,
+            simulation_param_ranges=simulation_param_ranges_config,
+            amplify_ab_fixed_value=amplify_ab_fixed_config_val,
+            input_min_max_global=norm_input_minmax_stats_global,
+            k_max_val=cfg["k_max_val"],
+            augmentation_strength=cfg["augmentation_strength"],
+            target_img_size=(512,512),
+            edge_loss_weight=cfg.get('edge_loss_weight', 1.0) # Použitie váhy z configu
+        )
+        train_loader = DataLoader(train_ds, batch_size=cfg["bs"], shuffle=True, 
+                                  num_workers=num_train_data_workers, 
+                                  collate_fn=collate_fn_skip_none_classification, 
+                                  pin_memory=device.type=='cuda', 
+                                  persistent_workers=True if num_train_data_workers > 0 else False)
+        
+        val_loader = None
+        if os.path.exists(path_valid_dataset) and len(glob.glob(os.path.join(path_valid_dataset, 'images', "*.tiff"))) > 0 :
+            val_ds = WrapCountDataset(path_valid_dataset,
+                                   input_min_max_global=norm_input_minmax_stats_global,
+                                   k_max_val=cfg["k_max_val"],
+                                   edge_loss_weight=cfg.get('edge_loss_weight', 1.0)) # Aj pre validačný dataset
+            val_loader = DataLoader(val_ds, batch_size=cfg["bs"], shuffle=False, 
+                                    num_workers=num_eval_data_workers, 
+                                    collate_fn=collate_fn_skip_none_classification, 
+                                    pin_memory=device.type=='cuda',
+                                    persistent_workers=True if num_eval_data_workers > 0 else False)
+        else:
+            print(f"VAROVANIE: Validačný dataset nebol nájdený alebo je prázdny v {path_valid_dataset}. Validácia bude preskočená.")
+
+        test_loader = None
+        if os.path.exists(path_test_dataset) and len(glob.glob(os.path.join(path_test_dataset, 'images', "*.tiff"))) > 0:
+            test_ds = WrapCountDataset(path_test_dataset,
+                                    input_min_max_global=norm_input_minmax_stats_global,
+                                    k_max_val=cfg["k_max_val"],
+                                    edge_loss_weight=cfg.get('edge_loss_weight', 1.0)) # Aj pre testovací dataset
+            test_loader = DataLoader(test_ds, batch_size=cfg["bs"], shuffle=False, 
+                                     num_workers=num_eval_data_workers, 
+                                     collate_fn=collate_fn_skip_none_classification, 
+                                     pin_memory=device.type=='cuda',
+                                     persistent_workers=True if num_eval_data_workers > 0 else False)
+        else:
+            print(f"VAROVANIE: Testovací dataset nebol nájdený alebo je prázdny v {path_test_dataset}. Testovanie bude preskočené.")
+
+        if val_loader is None: # Ak nemáme validačný set, nemôžeme robiť early stopping ani vyberať najlepší model
+            print(f"CHYBA: Validačný loader nie je dostupný pre {run_id_final}. Preskakujem tréning.")
+            all_clf_results.append({"run_id": run_id_final, "config": cfg, "metrics": {"error": "Missing validation data"}})
+            continue
+        
+        # Príprava cosine_eta_min pre volanie run_classification_training_session
+        # Ak nie je v cfg, použijeme fallback (napr. min_lr z cfg, alebo fixnú hodnotu)
+        effective_cosine_eta_min = cfg.get('cosine_eta_min')
+        if effective_cosine_eta_min is None:
+            effective_cosine_eta_min = cfg.get('min_lr', 1e-7) # Fallback na min_lr alebo inú default hodnotu
+
         exp_results = run_classification_training_session(
             run_id=run_id_final, device=device, num_epochs=cfg["epochs"],
             train_loader=train_loader, val_loader=val_loader, test_loader=test_loader,
-            input_min_max=norm_input_minmax_stats, # Pre info do configu
+            input_min_max_for_denorm=norm_input_minmax_stats_global, 
             encoder_name=cfg["encoder_name"], encoder_weights=cfg["encoder_weights"],
             k_max_val=cfg["k_max_val"],
-            learning_rate=cfg["lr"], weight_decay=1e-4,
-            scheduler_patience=cfg["sch_pat"], scheduler_factor=cfg.get("sch_factor", 0.2), 
-            min_lr=cfg.get("min_lr", 1e-7),
+            learning_rate=cfg["lr"], weight_decay=cfg.get("wd", 1e-5), 
+            # scheduler_patience=cfg["sch_pat"], scheduler_factor=cfg.get("sch_factor", 0.1), 
+            # min_lr=cfg.get("min_lr", 1e-7), # min_lr sa teraz používa pre cosine_eta_min
+            cosine_T_max=cfg["cosine_T_max"],
+            cosine_eta_min=effective_cosine_eta_min, 
             early_stopping_patience=cfg["es_pat"], 
-            augmentation_strength=cfg["augmentation_strength"]
+            augmentation_strength=cfg["augmentation_strength"],
+            train_data_source_type="Dynamic Simulation",
+            edge_loss_weight_value=cfg.get('edge_loss_weight', 1.0) # Poskytnutie váhy do tréningovej funkcie
         )
         all_clf_results.append({"run_id": run_id_final, "config": cfg, "metrics": exp_results})
 
+    # ... (Súhrn výsledkov zostáva rovnaké) ...
     print("\n\n" + "="*30 + " SÚHRN KLASIFIKAČNÝCH VÝSLEDKOV " + "="*30)
     for summary in all_clf_results:
-        print(f"Run: {summary['run_id']}")
-        print(f"  Best Val k-Acc: {summary['metrics'].get('best_val_k_accuracy', 'N/A'):.4f}")
-        # print(f"  Test Unwrapped MAE (Denorm): {summary['metrics'].get('test_final_mae_denorm', 'N/A'):.4f}")
-        print(f"  Test k-Acc: {summary['metrics'].get('test_k_accuracy', 'N/A'):.4f}")
+        metrics = summary.get('metrics', {})
+        print(f"Run: {summary.get('run_id', 'N/A')}")
+        print(f"  Best Val k-Acc (model saved): {metrics.get('best_val_k_accuracy', float('nan')):.4f}")
+        print(f"  Best Val MAE (overall tracked): {metrics.get('best_val_mae_overall', float('nan')):.4f}") 
+        print(f"  Test k-Acc:     {metrics.get('test_k_accuracy', float('nan')):.4f}")
+        print(f"  Test MAE (D,Rek): {metrics.get('test_mae_denorm', float('nan')):.6f}")
+        if "error" in metrics: print(f"  Chyba: {metrics['error']}")
         print("-" * 70)
     print(f"--- VŠETKY KLASIFIKAČNÉ EXPERIMENTY DOKONČENÉ ---")
 
 
 if __name__ == '__main__':
-    # Najprv definuj všetky potrebné triedy a funkcie (AddGaussianNoiseTransform, atď.)
-    # ktoré sú hore, alebo ich importuj, ak sú v inom súbore.
+    torch_seed = 42
+    torch.manual_seed(torch_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(torch_seed)
+        # Pre presnú reprodukovateľnosť, môže spomaliť:
+        # torch.backends.cudnn.deterministic = True
+        # torch.backends.cudnn.benchmark = False
     spusti_experimenty_klasifikacia()
