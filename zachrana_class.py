@@ -101,7 +101,7 @@ def denormalize_input_minmax_from_minus_one_one(data_norm_minus_one_one, origina
     return (data_norm_minus_one_one + 1.0) * (original_max - original_min) / 2.0 + original_min
 
 # --- Štatistické Funkcie (get_input_min_max_stats - ak by boli potrebné pre statické dáta) ---
-def get_input_min_max_stats(file_list, data_type_name="Input Data"):
+def get_input_min_max_stats(file_list, data_type_name="Input Data"): # Táto je všeobecná
     if not file_list: raise ValueError(f"Prázdny zoznam súborov pre {data_type_name}.")
     min_val_g, max_val_g = np.inf, -np.inf
     print(f"Počítam Min/Max pre {data_type_name} z {len(file_list)} súborov...")
@@ -114,6 +114,91 @@ def get_input_min_max_stats(file_list, data_type_name="Input Data"):
     if np.isinf(min_val_g) or np.isinf(max_val_g): raise ValueError(f"Nepodarilo sa načítať Min/Max pre {data_type_name}.")
     print(f"Výpočet Min/Max pre {data_type_name} dokončený.")
     return min_val_g, max_val_g
+
+# Pridaná/upravená funkcia špecificky pre wrapped input z referenčného datasetu
+def calculate_wrapped_input_min_max_from_ref_dataset(dataset_path, data_type_name="Wrapped Input Data (from Ref)"):
+    image_files = glob.glob(os.path.join(dataset_path, 'images', "*.tiff"))
+    if not image_files:
+        raise FileNotFoundError(f"Nenašli sa žiadne obrázky v {os.path.join(dataset_path, 'images')} pre výpočet Min/Max pre {data_type_name}.")
+    
+    min_val_g, max_val_g = np.inf, -np.inf
+    print(f"Počítam Min/Max pre {data_type_name} z {len(image_files)} súborov v {dataset_path}...")
+    for i, fp in enumerate(image_files):
+        try:
+            img = tiff.imread(fp).astype(np.float32)
+            min_val_g = min(min_val_g, img.min())
+            max_val_g = max(max_val_g, img.max())
+            if (i + 1) % 100 == 0 or (i + 1) == len(image_files):
+                print(f"  Spracovaných {i + 1}/{len(image_files)}...")
+        except Exception as e:
+            print(f"Chyba pri spracovaní súboru {fp} pre Min/Max: {e}")
+            
+    if np.isinf(min_val_g) or np.isinf(max_val_g):
+        raise ValueError(f"Nepodarilo sa určiť platné Min/Max hodnoty pre {data_type_name} z {dataset_path}.")
+    print(f"Výpočet Min/Max pre {data_type_name} dokončený: Min={min_val_g:.4f}, Max={max_val_g:.4f}")
+    return min_val_g, max_val_g
+
+def calculate_k_max_from_ref_dataset(dataset_path, target_img_size_for_consistency_check=None):
+    """
+    Vypočíta maximálnu absolútnu hodnotu k-rádu z referenčného datasetu.
+    dataset_path: Cesta k adresáru static_ref_train_dataset.
+    target_img_size_for_consistency_check: Voliteľné, pre kontrolu tvaru obrázkov.
+    """
+    images_dir = os.path.join(dataset_path, 'images')
+    labels_dir = os.path.join(dataset_path, 'labels')
+
+    if not os.path.exists(images_dir) or not os.path.exists(labels_dir):
+        raise FileNotFoundError(f"Adresáre 'images' alebo 'labels' neboli nájdené v {dataset_path}")
+
+    image_files = sorted(glob.glob(os.path.join(images_dir, "*.tiff")))
+    if not image_files:
+        raise FileNotFoundError(f"Nenašli sa žiadne obrázky v {images_dir} pre výpočet k_max.")
+
+    max_abs_k_found = 0.0
+    print(f"Počítam k_max z {len(image_files)} párov v {dataset_path}...")
+
+    for i, img_path in enumerate(image_files):
+        base_id_name = os.path.basename(img_path).replace('wrappedbg_', '').replace('.tiff', '')
+        lbl_path = os.path.join(labels_dir, f'unwrapped_{base_id_name}.tiff')
+
+        if not os.path.exists(lbl_path):
+            print(f"VAROVANIE: Chýbajúci label {lbl_path} pre obrázok {img_path}. Preskakujem.")
+            continue
+        
+        try:
+            wrapped_orig_np = tiff.imread(img_path).astype(np.float32)
+            unwrapped_orig_np = tiff.imread(lbl_path).astype(np.float32)
+
+            if wrapped_orig_np.shape != unwrapped_orig_np.shape:
+                print(f"VAROVANIE: Rozdielne tvary pre {img_path} ({wrapped_orig_np.shape}) a {lbl_path} ({unwrapped_orig_np.shape}). Preskakujem.")
+                continue
+            
+            # Voliteľná kontrola/úprava tvaru, ak je poskytnutá target_img_size
+            # Pre výpočet k_max je však lepšie použiť pôvodné dáta, ak je to možné.
+            # Ak by ste chceli vynútiť target_img_size aj tu, odkomentujte a prispôsobte:
+            # if target_img_size_for_consistency_check:
+            #     # Tu by bola potrebná podobná logika ako _ensure_shape_and_type v Dataset triedach
+            #     # wrapped_orig_np = _ensure_shape_and_type_static(wrapped_orig_np, target_img_size_for_consistency_check, "Wrapped (k_max calc)")
+            #     # unwrapped_orig_np = _ensure_shape_and_type_static(unwrapped_orig_np, target_img_size_for_consistency_check, "Unwrapped (k_max calc)")
+            #     pass
+
+
+            k_diff_np = (unwrapped_orig_np - wrapped_orig_np) / (2 * np.pi)
+            k_float_np = np.round(k_diff_np)
+            
+            current_max_abs_k = np.max(np.abs(k_float_np))
+            if current_max_abs_k > max_abs_k_found:
+                max_abs_k_found = current_max_abs_k
+            
+            if (i + 1) % 100 == 0 or (i + 1) == len(image_files):
+                print(f"  Spracovaných {i + 1}/{len(image_files)} pre k_max... Aktuálne max_abs_k: {max_abs_k_found:.2f}")
+
+        except Exception as e:
+            print(f"Chyba pri spracovaní páru {img_path}/{lbl_path} pre k_max: {e}")
+
+    calculated_k_max = int(np.ceil(max_abs_k_found))
+    print(f"Výpočet k_max dokončený. Nájdené max_abs_k_float: {max_abs_k_found:.2f}, Vypočítané k_max_val (ceil): {calculated_k_max}")
+    return calculated_k_max
 
 # --- Augmentačná Trieda ---
 class AddGaussianNoiseTransform(nn.Module):
@@ -233,7 +318,6 @@ class WrapCountDataset(Dataset):
         # Vertikálne rozdiely
         edge_mask[:-1, :] |= (k_label_np[:-1, :] != k_label_np[1:, :])
         edge_mask[1:, :] |= (k_label_np[1:, :] != k_label_np[:-1, :]) 
-        
         weight_map_np = np.ones_like(k_label_np, dtype=np.float32)
         weight_map_np[edge_mask] = self.edge_loss_weight # Použitie uloženej váhy
         weight_map_tensor = torch.from_numpy(weight_map_np)
@@ -732,20 +816,32 @@ def run_classification_training_session(
 
 def spusti_experimenty_klasifikacia():
     
-    GLOBAL_WRAPPED_INPUT_MIN, GLOBAL_WRAPPED_INPUT_MAX = -np.pi, np.pi 
-    norm_input_minmax_stats_global = (GLOBAL_WRAPPED_INPUT_MIN, GLOBAL_WRAPPED_INPUT_MAX)
-    print(f"Používajú sa globálne štatistiky pre wrapped vstup: Min={GLOBAL_WRAPPED_INPUT_MIN:.4f}, Max={GLOBAL_WRAPPED_INPUT_MAX:.4f}")
-
     # --- CESTY K DATASETOM ---
-    # Pre statické valid/test dáta
-    base_static_dataset_dir = 'split_dataset_tiff' # Adresár s podadresármi train_dataset, valid_dataset, test_dataset
-    path_valid_dataset = os.path.join(base_static_dataset_dir, 'valid_dataset')
-    path_test_dataset = os.path.join(base_static_dataset_dir, 'test_dataset')
+    base_output_dir = "split_dataset_tiff_for_dynamic_v_stratified_final"
+    path_static_ref_train = os.path.join(base_output_dir, "static_ref_train_dataset")
+    path_valid_dataset = os.path.join(base_output_dir, 'static_valid_dataset')
+    path_test_dataset = os.path.join(base_output_dir, 'static_test_dataset')
+    path_dynamic_train_source_images = os.path.join(base_output_dir, "train_dataset_source_for_dynamic_generation", "images")
+
+    # --- VÝPOČET NORMALIZAČNÝCH ŠTATISTÍK PRE WRAPPED VSTUP ---
+    # Namiesto fixných -pi, pi, vypočítame z static_ref_train_dataset/images/
+    if not os.path.exists(os.path.join(path_static_ref_train, 'images')):
+        raise FileNotFoundError(f"Adresár s obrázkami pre referenčný tréningový dataset nebol nájdený: {os.path.join(path_static_ref_train, 'images')}")
     
-    # Pre zdrojové obrázky pre dynamický tréning
-    # Predpokladáme štruktúru z regresného skriptu:
-    output_base_dir_from_script1_reg = "split_dataset_tiff_for_dynamic_v_stratified_final" 
-    path_dynamic_train_source_images = os.path.join(output_base_dir_from_script1_reg, "train_dataset_source_for_dynamic_generation", "images")
+    GLOBAL_WRAPPED_INPUT_MIN, GLOBAL_WRAPPED_INPUT_MAX = calculate_wrapped_input_min_max_from_ref_dataset(
+        path_static_ref_train, "Global Wrapped Input (from Ref Train)"
+    )
+    norm_input_minmax_stats_global = (GLOBAL_WRAPPED_INPUT_MIN, GLOBAL_WRAPPED_INPUT_MAX)
+    print(f"Používajú sa vypočítané globálne štatistiky pre wrapped vstup (normalizácia na [-1,1]): Min={GLOBAL_WRAPPED_INPUT_MIN:.4f}, Max={GLOBAL_WRAPPED_INPUT_MAX:.4f}")
+
+    # --- VÝPOČET k_max_val Z REFERENČNÉHO DATASETU ---
+    # Predpokladáme, že target_img_size pre konzistenciu pri výpočte k_max nie je striktne nutný,
+    # keďže k-rády sú pixel-wise. Ak by bol, doplňte target_img_size=(512,512) ako argument.
+    CALCULATED_K_MAX_FROM_DATA = calculate_k_max_from_ref_dataset(path_static_ref_train)
+    NUM_CLASSES_EFFECTIVE_FROM_DATA = 2 * CALCULATED_K_MAX_FROM_DATA + 1
+    print(f"Globálne vypočítané k_max_val z referenčného datasetu: {CALCULATED_K_MAX_FROM_DATA}")
+    print(f"Zodpovedajúci počet efektívnych tried: {NUM_CLASSES_EFFECTIVE_FROM_DATA}")
+
 
     if not os.path.exists(path_dynamic_train_source_images):
         raise FileNotFoundError(f"Adresár so zdrojovými obrázkami pre dynamický tréning nebol nájdený: {path_dynamic_train_source_images}")
@@ -778,54 +874,58 @@ def spusti_experimenty_klasifikacia():
     
     experiments_clf = [
         {
-            "run_id_suffix": "AUTO_GENERATED", 
+            "run_id_suffix": "AUTO_GENERATED", # k_max_val sa už nebude brať odtiaľto pre počet tried
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
-            "k_max_val": 6, 
+            # "k_max_val": 6, # Táto hodnota sa nahradí CALCULATED_K_MAX_FROM_DATA
             "augmentation_strength": "medium", 
             "lr": 1e-3, "bs": 8, "epochs": 120, "wd": 1e-4,
             "es_pat": 30, 
-            "cosine_T_max": 120, 
+            "cosine_T_max": 120,   
             "cosine_eta_min": 1e-7,
-            "edge_loss_weight": 3.0 # Nový parameter pre konfiguráciu
+            "edge_loss_weight": 3.0 
         },
         {
             "run_id_suffix": "AUTO_GENERATED", 
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
-            "k_max_val": 6, 
+            # "k_max_val": 6, 
             "augmentation_strength": "medium", 
             "lr": 1e-3, "bs": 8, "epochs": 120, "wd": 1e-4,
             "es_pat": 30, 
             "cosine_T_max": 120, 
             "cosine_eta_min": 1e-7,
-            "edge_loss_weight": 5.0 # Rôzna váha pre iný experiment
+            "edge_loss_weight": 5.0 
         },
         {
             "run_id_suffix": "AUTO_GENERATED", 
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
-            "k_max_val": 6, 
+            # "k_max_val": 6, 
             "augmentation_strength": "medium", 
             "lr": 1e-3, "bs": 8, "epochs": 120, "wd": 1e-4,
             "es_pat": 30, 
             "cosine_T_max": 120, 
             "cosine_eta_min": 1e-7,
-            "edge_loss_weight": 7.0 # Rôzna váha pre iný experiment
+            "edge_loss_weight": 7.0 
         },
         {
             "run_id_suffix": "AUTO_GENERATED", 
             "encoder_name": "resnet34", "encoder_weights": "imagenet",
-            "k_max_val": 6, 
+            # "k_max_val": 6, 
             "augmentation_strength": "medium", 
             "lr": 1e-3, "bs": 8, "epochs": 120, "wd": 1e-4,
             "es_pat": 30, 
             "cosine_T_max": 120, 
             "cosine_eta_min": 1e-7,
-            "edge_loss_weight": 9.0 # Rôzna váha pre iný experiment
+            "edge_loss_weight": 9.0 
         },
     ]
 
     all_clf_results = []
     for cfg_original in experiments_clf:
         cfg = cfg_original.copy() 
+        
+        # Použijeme globálne vypočítané k_max_val
+        current_k_max_for_experiment = CALCULATED_K_MAX_FROM_DATA
+        cfg['k_max_val'] = current_k_max_for_experiment # Aktualizujeme cfg pre logovanie a použitie
 
         # --- Dynamické generovanie run_id_suffix (zostáva podobné) ---
         encoder_short_map = {"resnet18": "R18", "resnet34": "R34", "resnet50": "R50",
@@ -834,7 +934,7 @@ def spusti_experimenty_klasifikacia():
         enc_weights_part = "imgnet" if cfg["encoder_weights"] == "imagenet" else "scratch"
         enc_part = f"{enc_name_part}{enc_weights_part}"
         
-        kmax_part = f"Kmax{cfg['k_max_val']}"
+        kmax_part = f"Kmax{current_k_max_for_experiment}" # Použijeme vypočítanú hodnotu
         aug_part = f"Aug{cfg['augmentation_strength'][:3].capitalize()}" if cfg['augmentation_strength'] != 'none' else "AugNone"
         lr_part = f"LR{cfg['lr']:.0e}".replace('-', 'm')
         
@@ -883,10 +983,10 @@ def spusti_experimenty_klasifikacia():
             simulation_param_ranges=simulation_param_ranges_config,
             amplify_ab_fixed_value=amplify_ab_fixed_config_val,
             input_min_max_global=norm_input_minmax_stats_global,
-            k_max_val=cfg["k_max_val"],
+            k_max_val=current_k_max_for_experiment, # Použijeme vypočítanú hodnotu
             augmentation_strength=cfg["augmentation_strength"],
             target_img_size=(512,512),
-            edge_loss_weight=cfg.get('edge_loss_weight', 1.0) # Použitie váhy z configu
+            edge_loss_weight=cfg.get('edge_loss_weight', 1.0) 
         )
         train_loader = DataLoader(train_ds, batch_size=cfg["bs"], shuffle=True, 
                                   num_workers=num_train_data_workers, 
@@ -898,8 +998,8 @@ def spusti_experimenty_klasifikacia():
         if os.path.exists(path_valid_dataset) and len(glob.glob(os.path.join(path_valid_dataset, 'images', "*.tiff"))) > 0 :
             val_ds = WrapCountDataset(path_valid_dataset,
                                    input_min_max_global=norm_input_minmax_stats_global,
-                                   k_max_val=cfg["k_max_val"],
-                                   edge_loss_weight=cfg.get('edge_loss_weight', 1.0)) # Aj pre validačný dataset
+                                   k_max_val=current_k_max_for_experiment, # Použijeme vypočítanú hodnotu
+                                   edge_loss_weight=cfg.get('edge_loss_weight', 1.0)) 
             val_loader = DataLoader(val_ds, batch_size=cfg["bs"], shuffle=False, 
                                     num_workers=num_eval_data_workers, 
                                     collate_fn=collate_fn_skip_none_classification, 
@@ -912,8 +1012,8 @@ def spusti_experimenty_klasifikacia():
         if os.path.exists(path_test_dataset) and len(glob.glob(os.path.join(path_test_dataset, 'images', "*.tiff"))) > 0:
             test_ds = WrapCountDataset(path_test_dataset,
                                     input_min_max_global=norm_input_minmax_stats_global,
-                                    k_max_val=cfg["k_max_val"],
-                                    edge_loss_weight=cfg.get('edge_loss_weight', 1.0)) # Aj pre testovací dataset
+                                    k_max_val=current_k_max_for_experiment, # Použijeme vypočítanú hodnotu
+                                    edge_loss_weight=cfg.get('edge_loss_weight', 1.0)) 
             test_loader = DataLoader(test_ds, batch_size=cfg["bs"], shuffle=False, 
                                      num_workers=num_eval_data_workers, 
                                      collate_fn=collate_fn_skip_none_classification, 
@@ -938,16 +1038,14 @@ def spusti_experimenty_klasifikacia():
             train_loader=train_loader, val_loader=val_loader, test_loader=test_loader,
             input_min_max_for_denorm=norm_input_minmax_stats_global, 
             encoder_name=cfg["encoder_name"], encoder_weights=cfg["encoder_weights"],
-            k_max_val=cfg["k_max_val"],
+            k_max_val=current_k_max_for_experiment, # Použijeme vypočítanú hodnotu
             learning_rate=cfg["lr"], weight_decay=cfg.get("wd", 1e-5), 
-            # scheduler_patience=cfg["sch_pat"], scheduler_factor=cfg.get("sch_factor", 0.1), 
-            # min_lr=cfg.get("min_lr", 1e-7), # min_lr sa teraz používa pre cosine_eta_min
             cosine_T_max=cfg["cosine_T_max"],
             cosine_eta_min=effective_cosine_eta_min, 
             early_stopping_patience=cfg["es_pat"], 
             augmentation_strength=cfg["augmentation_strength"],
             train_data_source_type="Dynamic Simulation",
-            edge_loss_weight_value=cfg.get('edge_loss_weight', 1.0) # Poskytnutie váhy do tréningovej funkcie
+            edge_loss_weight_value=cfg.get('edge_loss_weight', 1.0) 
         )
         all_clf_results.append({"run_id": run_id_final, "config": cfg, "metrics": exp_results})
 
