@@ -217,8 +217,7 @@ def evaluate_and_visualize_model(
         print(f"  {key}: {value}")
     print("-" * 30)
 
-    encoder_name = config.get("Encoder Name", "resnet34") # Default z dwc.py
-    # K_MAX a NUM_CLASSES
+    encoder_name = config.get("Encoder Name", "resnet34") 
     k_max_val_from_config = config.get("K_MAX")
     if k_max_val_from_config is None:
         print(f"VAROVANIE: 'K_MAX' nenájdené v configu, používam fallback: {KMAX_DEFAULT_FALLBACK}")
@@ -234,9 +233,7 @@ def evaluate_and_visualize_model(
         num_classes_effective = int(num_classes_effective_from_config)
         if num_classes_effective != (2 * k_max_val + 1):
             print(f"VAROVANIE: Nesúlad medzi NUM_CLASSES ({num_classes_effective}) a K_MAX ({k_max_val}) v configu.")
-            # Dôverujeme K_MAX pre rekonštrukciu, NUM_CLASSES pre model
             
-    # Input normalization stats
     input_norm_str = config.get("Input Normalization (Global MinMax for Wrapped)")
     global_input_min, global_input_max = None, None
     if input_norm_str:
@@ -261,13 +258,12 @@ def evaluate_and_visualize_model(
         path_to_data=test_dataset_path,
         input_min_max_global=(global_input_min, global_input_max),
         k_max_val=k_max_val
-        # target_img_size a edge_loss_weight majú defaulty, ak nie sú kritické pre eval
     )
     if len(test_dataset) == 0:
         print("CHYBA: Testovací dataset je prázdny.")
         return
     
-    test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=0, # Menší batch_size pre eval
+    test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=0, 
                              collate_fn=collate_fn_skip_none_classification)
     
     # --- Načítanie Modelu ---
@@ -277,9 +273,9 @@ def evaluate_and_visualize_model(
     try:
         net = smp.Unet(
             encoder_name=encoder_name,
-            encoder_weights=None, # Váhy sa načítajú zo súboru
-            in_channels=1,        # Normalizovaný wrapped vstup
-            classes=num_classes_effective, # Počet k-tried
+            encoder_weights=None, 
+            in_channels=1,        
+            classes=num_classes_effective, 
             activation=None
         ).to(device)
         print(f"Používam smp.Unet s enkóderom: {encoder_name}, Počet tried: {num_classes_effective}")
@@ -302,134 +298,279 @@ def evaluate_and_visualize_model(
     all_psnr_reconstructed = []
     all_ssim_reconstructed = []
     
-    best_mae_sample_info = {"mae": float('inf'), "index": -1, "wrapped_orig": None, "gt_unwrapped": None, "pred_unwrapped_reconstructed": None}
-    worst_mae_sample_info = {"mae": -1.0, "index": -1, "wrapped_orig": None, "gt_unwrapped": None, "pred_unwrapped_reconstructed": None}
+    all_pixel_errors_flat_rec = [] # Pre histogram chýb rekonštrukcie
+    all_samples_data_for_avg_rec = [] # Pre nájdenie priemernej MAE vzorky
+
+    # Informácie pre najlepší, najhorší a priemerný prípad MAE (rekonštrukcia)
+    best_mae_sample_info_rec = {"mae": float('inf'), "index": -1, "wrapped_orig": None, "gt_unwrapped": None, "pred_unwrapped_reconstructed": None}
+    worst_mae_sample_info_rec = {"mae": -1.0, "index": -1, "wrapped_orig": None, "gt_unwrapped": None, "pred_unwrapped_reconstructed": None}
+    avg_mae_sample_info_rec = {"mae": -1.0, "index": -1, "wrapped_orig": None, "gt_unwrapped": None, "pred_unwrapped_reconstructed": None, "diff_from_avg_mae": float('inf')}
     
     with torch.no_grad():
-        for i, batch_data in enumerate(test_loader):
+        for i, batch_data in enumerate(test_loader): # Použijeme tqdm tu
             if batch_data is None or batch_data[0] is None:
                 print(f"Preskakujem chybný batch v teste, iterácia {i}")
                 continue
             
-            # wrapped_input_norm_tensor, k_label_tensor, unwrapped_gt_orig_tensor, wrapped_orig_tensor, weight_map_tensor
             input_norm_batch, k_labels_gt_batch, unwrapped_gt_orig_batch, wrapped_orig_batch, _ = batch_data
             
             input_norm_batch = input_norm_batch.to(device)
-            k_labels_gt_batch = k_labels_gt_batch.to(device) # Pre k-accuracy
-            # unwrapped_gt_orig_batch a wrapped_orig_batch zostávajú na CPU pre numpy operácie, alebo presunúť podľa potreby
+            k_labels_gt_batch_dev = k_labels_gt_batch.to(device) 
 
-            logits_batch = net(input_norm_batch) # (B, NumClasses, H, W)
-            pred_classes_batch = torch.argmax(logits_batch, dim=1) # (B, H, W)
+            logits_batch = net(input_norm_batch) 
+            pred_classes_batch = torch.argmax(logits_batch, dim=1) 
 
-            # Výpočet k-accuracy
-            current_k_acc = k_label_accuracy_full(logits_batch, k_labels_gt_batch.to(device)) # k_labels musia byť na device
+            current_k_acc = k_label_accuracy_full(logits_batch, k_labels_gt_batch_dev) 
             all_k_accuracy.append(current_k_acc.item())
 
-            # Rekonštrukcia a MAE pre každú vzorku v batchi
             for k_idx in range(pred_classes_batch.size(0)):
-                current_sample_global_idx = i * test_loader.batch_size + k_idx # Približný index, ak batch_size nie je fixný
+                current_sample_global_idx = i * test_loader.batch_size + k_idx 
                 
-                pred_classes_sample = pred_classes_batch[k_idx].cpu() # (H,W)
-                wrapped_orig_sample_numpy = wrapped_orig_batch[k_idx].cpu().numpy().squeeze() # (H,W)
-                unwrapped_gt_orig_sample_numpy = unwrapped_gt_orig_batch[k_idx].cpu().numpy().squeeze() # (H,W)
+                pred_classes_sample = pred_classes_batch[k_idx].cpu() 
+                wrapped_orig_sample_numpy = wrapped_orig_batch[k_idx].cpu().numpy().squeeze() 
+                unwrapped_gt_orig_sample_numpy = unwrapped_gt_orig_batch[k_idx].cpu().numpy().squeeze() 
 
-                k_pred_values_sample = pred_classes_sample.float() - k_max_val # (H,W)
+                k_pred_values_sample = pred_classes_sample.float() - k_max_val 
                 unwrapped_pred_reconstructed_numpy = wrapped_orig_sample_numpy + (2 * np.pi) * k_pred_values_sample.numpy()
 
-                mae = np.mean(np.abs(unwrapped_pred_reconstructed_numpy - unwrapped_gt_orig_sample_numpy))
+                # Zber chýb pre histogram
+                current_pixel_errors_rec = np.abs(unwrapped_pred_reconstructed_numpy - unwrapped_gt_orig_sample_numpy)
+                all_pixel_errors_flat_rec.extend(current_pixel_errors_rec.flatten().tolist())
+
+                mae = np.mean(current_pixel_errors_rec)
                 all_mae_reconstructed.append(mae)
+                
+                # Uloženie dát pre nájdenie priemernej MAE vzorky
+                all_samples_data_for_avg_rec.append((mae, wrapped_orig_sample_numpy, unwrapped_gt_orig_sample_numpy, unwrapped_pred_reconstructed_numpy, current_sample_global_idx))
+
 
                 if SKIMAGE_AVAILABLE:
                     psnr_val, ssim_val = calculate_psnr_ssim(unwrapped_gt_orig_sample_numpy, unwrapped_pred_reconstructed_numpy)
                     if not np.isnan(psnr_val): all_psnr_reconstructed.append(psnr_val)
                     if not np.isnan(ssim_val): all_ssim_reconstructed.append(ssim_val)
                 
-                # Aktualizácia najlepšej/najhoršej MAE
-                if mae < best_mae_sample_info["mae"]:
-                    best_mae_sample_info["mae"] = mae
-                    best_mae_sample_info["index"] = current_sample_global_idx # Ukladáme index vzorky
-                    best_mae_sample_info["wrapped_orig"] = wrapped_orig_sample_numpy
-                    best_mae_sample_info["gt_unwrapped"] = unwrapped_gt_orig_sample_numpy
-                    best_mae_sample_info["pred_unwrapped_reconstructed"] = unwrapped_pred_reconstructed_numpy
+                if mae < best_mae_sample_info_rec["mae"]:
+                    best_mae_sample_info_rec.update({"mae": mae, "index": current_sample_global_idx, 
+                                                 "wrapped_orig": wrapped_orig_sample_numpy, 
+                                                 "gt_unwrapped": unwrapped_gt_orig_sample_numpy, 
+                                                 "pred_unwrapped_reconstructed": unwrapped_pred_reconstructed_numpy})
                 
-                if mae > worst_mae_sample_info["mae"]:
-                    worst_mae_sample_info["mae"] = mae
-                    worst_mae_sample_info["index"] = current_sample_global_idx
-                    worst_mae_sample_info["wrapped_orig"] = wrapped_orig_sample_numpy
-                    worst_mae_sample_info["gt_unwrapped"] = unwrapped_gt_orig_sample_numpy
-                    worst_mae_sample_info["pred_unwrapped_reconstructed"] = unwrapped_pred_reconstructed_numpy
+                if mae > worst_mae_sample_info_rec["mae"]:
+                    worst_mae_sample_info_rec.update({"mae": mae, "index": current_sample_global_idx, 
+                                                  "wrapped_orig": wrapped_orig_sample_numpy, 
+                                                  "gt_unwrapped": unwrapped_gt_orig_sample_numpy, 
+                                                  "pred_unwrapped_reconstructed": unwrapped_pred_reconstructed_numpy})
 
     avg_mae_rec = np.mean(all_mae_reconstructed) if all_mae_reconstructed else np.nan
     avg_k_acc = np.mean(all_k_accuracy) if all_k_accuracy else np.nan
     avg_psnr_rec = np.mean(all_psnr_reconstructed) if all_psnr_reconstructed else np.nan
     avg_ssim_rec = np.mean(all_ssim_reconstructed) if all_ssim_reconstructed else np.nan
 
-    print("\n--- Celkové Priemerné Metriky na Testovacom Datasete (Klasifikácia) ---")
+    print("\n--- Celkové Priemerné Metriky na Testovacom Datasete (Klasifikácia & Rekonštrukcia) ---")
     print(f"Priemerná MAE (rekonštrukcia): {avg_mae_rec:.4f}")
     print(f"Priemerná k-label Accuracy: {avg_k_acc:.4f}")
     if SKIMAGE_AVAILABLE:
         print(f"Priemerný PSNR (rekonštrukcia): {avg_psnr_rec:.2f} dB")
         print(f"Priemerný SSIM (rekonštrukcia): {avg_ssim_rec:.4f}")
     
-    print("\n--- Extrémne Hodnoty MAE (Rekonštrukcia) ---")
-    if best_mae_sample_info["index"] != -1:
-        print(f"Najlepšia MAE (rekon.): {best_mae_sample_info['mae']:.4f} (index: {best_mae_sample_info['index']})")
-    if worst_mae_sample_info["index"] != -1:
-        print(f"Najhoršia MAE (rekon.): {worst_mae_sample_info['mae']:.4f} (index: {worst_mae_sample_info['index']})")
-
-    # --- Vizualizácia Najlepšej a Najhoršej MAE (Rekonštrukcia) ---
-    if best_mae_sample_info["index"] != -1 and worst_mae_sample_info["index"] != -1:
-        print(f"\nVizualizujem a ukladám najlepší a najhorší MAE prípad (rekonštrukcia)...")
+    # Nájdenie vzorky najbližšej k priemernej MAE (rekonštrukcia)
+    if not np.isnan(avg_mae_rec) and all_samples_data_for_avg_rec:
+        min_diff_to_avg_mae_rec = float('inf')
+        avg_candidate_data_rec = None
+        for sample_mae_val, s_wrapped, s_gt_unwrapped, s_pred_unwrapped, s_idx in all_samples_data_for_avg_rec:
+            diff = abs(sample_mae_val - avg_mae_rec)
+            if diff < min_diff_to_avg_mae_rec:
+                min_diff_to_avg_mae_rec = diff
+                avg_candidate_data_rec = (sample_mae_val, s_wrapped, s_gt_unwrapped, s_pred_unwrapped, s_idx)
         
-        fig, axs = plt.subplots(2, 3, figsize=(18, 10))
-        run_name_for_file = os.path.splitext(os.path.basename(weights_path))[0].replace("best_weights_clf_", "eval_clf_")
+        if avg_candidate_data_rec:
+            avg_mae_sample_info_rec.update({
+                "mae": avg_candidate_data_rec[0], 
+                "wrapped_orig": avg_candidate_data_rec[1],
+                "gt_unwrapped": avg_candidate_data_rec[2],
+                "pred_unwrapped_reconstructed": avg_candidate_data_rec[3],
+                "index": avg_candidate_data_rec[4],
+                "diff_from_avg_mae": min_diff_to_avg_mae_rec
+            })
 
-        # Riadok 1: Najlepšia MAE
-        axs[0, 0].imshow(best_mae_sample_info["wrapped_orig"], cmap='gray')
-        axs[0, 0].set_title("Zabalený obraz", fontsize=14); axs[0, 0].axis('off')
+    print("\n--- Extrémne a Priemerné Hodnoty MAE (Rekonštrukcia) ---")
+    if best_mae_sample_info_rec["index"] != -1:
+        print(f"Najlepšia MAE (rekon.): {best_mae_sample_info_rec['mae']:.4f} (index: {best_mae_sample_info_rec['index']})")
+    if avg_mae_sample_info_rec["index"] != -1:
+        print(f"Vzorka najbližšie k priemernej MAE (rekon. {avg_mae_rec:.4f}): MAE={avg_mae_sample_info_rec['mae']:.4f} (index: {avg_mae_sample_info_rec['index']}, rozdiel: {avg_mae_sample_info_rec['diff_from_avg_mae']:.4f})")
+    if worst_mae_sample_info_rec["index"] != -1:
+        print(f"Najhoršia MAE (rekon.): {worst_mae_sample_info_rec['mae']:.4f} (index: {worst_mae_sample_info_rec['index']})")
 
-        axs[0, 1].imshow(best_mae_sample_info["gt_unwrapped"], cmap='gray')
-        axs[0, 1].set_title("Rozbalený referenčný obraz", fontsize=14); axs[0, 1].axis('off')
-        
-        common_min_best = min(best_mae_sample_info["gt_unwrapped"].min(), best_mae_sample_info["pred_unwrapped_reconstructed"].min())
-        common_max_best = max(best_mae_sample_info["gt_unwrapped"].max(), best_mae_sample_info["pred_unwrapped_reconstructed"].max())
-        axs[0, 2].imshow(best_mae_sample_info["pred_unwrapped_reconstructed"], cmap='gray', vmin=common_min_best, vmax=common_max_best)
-        axs[0, 2].set_title(f"Najlepšia predikcia\nMAE: {best_mae_sample_info['mae']:.4f}", fontsize=14); axs[0, 2].axis('off')
-        
-        # Riadok 2: Najhoršia MAE
-        axs[1, 0].imshow(worst_mae_sample_info["wrapped_orig"], cmap='gray')
-        axs[1, 0].set_title("Zabalený obraz", fontsize=14); axs[1, 0].axis('off')
+    run_name_for_file = os.path.splitext(os.path.basename(weights_path))[0].replace("best_weights_clf_", "eval_clf_")
 
-        axs[1, 1].imshow(worst_mae_sample_info["gt_unwrapped"], cmap='gray')
-        axs[1, 1].set_title("Rozbalený referenčný obraz", fontsize=14); axs[1, 1].axis('off')
+    # Uloženie extrémnych a priemerných MAE hodnôt do textového súboru
+    if best_mae_sample_info_rec["index"] != -1 or worst_mae_sample_info_rec["index"] != -1 or avg_mae_sample_info_rec["index"] != -1:
+        extreme_mae_log_path_rec = f"extreme_mae_values_reconstruction_{run_name_for_file}.txt"
+        with open(extreme_mae_log_path_rec, 'w') as f:
+            f.write(f"Experiment (Klasifikácia & Rekonštrukcia): {run_name_for_file}\n")
+            f.write("--- Extrémne a Priemerné Hodnoty MAE (Rekonštrukcia) ---\n")
+            if best_mae_sample_info_rec["index"] != -1:
+                f.write(f"Najlepšia MAE (rekon.): {best_mae_sample_info_rec['mae']:.6f} (index: {best_mae_sample_info_rec['index']})\n")
+            if avg_mae_sample_info_rec["index"] != -1:
+                f.write(f"Vzorka najbližšie k priemernej MAE (rekon. {avg_mae_rec:.6f}): MAE={avg_mae_sample_info_rec['mae']:.6f} (index: {avg_mae_sample_info_rec['index']}, rozdiel: {avg_mae_sample_info_rec['diff_from_avg_mae']:.6f})\n")
+            if worst_mae_sample_info_rec["index"] != -1:
+                f.write(f"Najhoršia MAE (rekon.): {worst_mae_sample_info_rec['mae']:.6f} (index: {worst_mae_sample_info_rec['index']})\n")
+            f.write(f"\nPriemerná MAE (rekonštrukcia, celý dataset): {avg_mae_rec:.6f}\n")
+            f.write(f"Priemerná k-label Accuracy (celý dataset): {avg_k_acc:.6f}\n")
+        print(f"Extrémne a priemerné MAE (rekon.) hodnoty uložené do: {extreme_mae_log_path_rec}")
 
-        common_min_worst = min(worst_mae_sample_info["gt_unwrapped"].min(), worst_mae_sample_info["pred_unwrapped_reconstructed"].min())
-        common_max_worst = max(worst_mae_sample_info["gt_unwrapped"].max(), worst_mae_sample_info["pred_unwrapped_reconstructed"].max())
-        axs[1, 2].imshow(worst_mae_sample_info["pred_unwrapped_reconstructed"], cmap='gray', vmin=common_min_worst, vmax=common_max_worst)
-        axs[1, 2].set_title(f"Najhoršia predikcia\nMAE: {worst_mae_sample_info['mae']:.4f}", fontsize=14); axs[1, 2].axis('off')
-
-        plt.tight_layout()
-        base_save_name = f"best_worst_mae_reconstruction_{run_name_for_file}"
-        save_fig_path_png = f"{base_save_name}.png"
-        save_fig_path_svg = f"{base_save_name}.svg"
-
-        plt.savefig(save_fig_path_png)
-        print(f"Vizualizácia uložená do: {save_fig_path_png}")
-        plt.savefig(save_fig_path_svg)
-        print(f"Vizualizácia uložená aj do: {save_fig_path_svg}")
+    # --- Histogram Chýb Rekonštrukcie ---
+    if all_pixel_errors_flat_rec:
+        all_pixel_errors_flat_rec_np = np.array(all_pixel_errors_flat_rec)
+        plt.figure(figsize=(12, 7))
+        plt.hist(all_pixel_errors_flat_rec_np, bins=100, color='mediumseagreen', edgecolor='black', alpha=0.7)
+        plt.title('Histogram Absolútnych Chýb Rekonštrukcie (všetky pixely)', fontsize=16)
+        plt.xlabel('Absolútna Chyba Rekonštrukcie (radiány)', fontsize=14)
+        plt.ylabel('Počet Pixelov', fontsize=14)
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.yscale('log') 
+        hist_rec_save_path_png = f"error_histogram_reconstruction_{run_name_for_file}.png"
+        hist_rec_save_path_svg = f"error_histogram_reconstruction_{run_name_for_file}.svg"
+        plt.savefig(hist_rec_save_path_png)
+        plt.savefig(hist_rec_save_path_svg)
+        print(f"Histogram chýb rekonštrukcie uložený do: {hist_rec_save_path_png} a {hist_rec_save_path_svg}")
         plt.show()
+        plt.close()
+
+    # --- Vizualizácia Najlepšej, Priemernej a Najhoršej MAE (Rekonštrukcia) s Mapami Chýb ---
+    if best_mae_sample_info_rec["index"] != -1 and worst_mae_sample_info_rec["index"] != -1 and avg_mae_sample_info_rec["index"] != -1:
+        print(f"\nVizualizujem a ukladám najlepší, priemerný a najhorší MAE prípad (rekonštrukcia)...")
+        
+        samples_to_plot_rec = [
+            ("Min MAE (Rekon.)", best_mae_sample_info_rec),
+            ("Avg MAE (Rekon.)", avg_mae_sample_info_rec),
+            ("Max MAE (Rekon.)", worst_mae_sample_info_rec)
+        ]
+
+        all_wrapped_col1 = []
+        all_gt_pred_unwrapped_col23 = []
+
+        for _, sample_info in samples_to_plot_rec:
+            all_wrapped_col1.append(sample_info["wrapped_orig"])
+            all_gt_pred_unwrapped_col23.append(sample_info["gt_unwrapped"])
+            all_gt_pred_unwrapped_col23.append(sample_info["pred_unwrapped_reconstructed"])
+
+        # Globálne min/max pre konzistentné škály v stĺpcoch
+        vmin_col1_rec = np.min([img.min() for img in all_wrapped_col1 if img is not None]) if any(img is not None for img in all_wrapped_col1) else 0
+        vmax_col1_rec = np.max([img.max() for img in all_wrapped_col1 if img is not None]) if any(img is not None for img in all_wrapped_col1) else 1
+        if vmax_col1_rec <= vmin_col1_rec: vmax_col1_rec = vmin_col1_rec + 1e-5
+
+
+        vmin_col23_rec = np.min([img.min() for img in all_gt_pred_unwrapped_col23 if img is not None]) if any(img is not None for img in all_gt_pred_unwrapped_col23) else 0
+        vmax_col23_rec = np.max([img.max() for img in all_gt_pred_unwrapped_col23 if img is not None]) if any(img is not None for img in all_gt_pred_unwrapped_col23) else 1
+        if vmax_col23_rec <= vmin_col23_rec: vmax_col23_rec = vmin_col23_rec + 1e-5
+        
+        fig, axs = plt.subplots(3, 4, figsize=(16, 13)) # Zmenené figsize
+
+        # Názvy stĺpcov podľa vysledky_drg.py
+        col_titles_aligned = ["Zabalený obraz", "Rozbalený referenčný obraz", "Predikcia", "Absolútna chyba"]
+        # row_titles_rec sú v sample_info[0] a nebudú sa nastavovať ako ylabel
+
+        error_map_mappables_rec = []
+        img0_for_cbar, img1_for_cbar = None, None # Pre zdieľané colorbary
+
+        for i, (row_desc, sample_info) in enumerate(samples_to_plot_rec):
+            # Stĺpec 1: Zabalený obraz
+            current_img0 = axs[i, 0].imshow(sample_info["wrapped_orig"], cmap='gray', vmin=vmin_col1_rec, vmax=vmax_col1_rec)
+            if i == 0: img0_for_cbar = current_img0 # Uložíme pre zdieľaný colorbar
+
+            # Stĺpec 2: Rozbalený referenčný
+            current_img1 = axs[i, 1].imshow(sample_info["gt_unwrapped"], cmap='gray', vmin=vmin_col23_rec, vmax=vmax_col23_rec)
+            if i == 0: img1_for_cbar = current_img1 # Uložíme pre zdieľaný colorbar
+            
+            # Stĺpec 3: Rekonštrukcia (Predikcia)
+            axs[i, 2].imshow(sample_info["pred_unwrapped_reconstructed"], cmap='gray', vmin=vmin_col23_rec, vmax=vmax_col23_rec)
+            
+            # Stĺpec 4: Absolútna chyba
+            error_map_rec = np.abs(sample_info["pred_unwrapped_reconstructed"] - sample_info["gt_unwrapped"])
+            # Zabezpečenie, že vmax je vždy väčšie ako vmin pre individuálnu škálu chyby
+            err_min_val = error_map_rec.min()
+            err_max_val = error_map_rec.max()
+            if err_max_val <= err_min_val:
+                err_max_val = err_min_val + 1e-5
+            
+            img3 = axs[i, 3].imshow(error_map_rec, cmap='viridis', vmin=err_min_val, vmax=err_max_val) # Individuálne škály pre chyby
+            error_map_mappables_rec.append(img3)
+
+            # Odstránené axs[i,0].set_ylabel(...)
+
+        for j, col_title_text in enumerate(col_titles_aligned):
+            axs[0, j].set_title(col_title_text, fontsize=16, pad=20)
+
+        for ax_row in axs:
+            for ax in ax_row:
+                ax.axis('off')
+        
+        # Individuálne farebné škály pre mapy chýb (ako v drg)
+        for i in range(3):
+            fig.colorbar(error_map_mappables_rec[i], ax=axs[i, 3], orientation='vertical', fraction=0.046, pad=0.02, aspect=15)
+
+        # Úprava rozloženia podľa vysledky_drg.py
+        plt.subplots_adjust(left=0.05, right=0.95, bottom=0.18, top=0.90, wspace=0.0, hspace=0.06)
+
+        # Spoločný colorbar pre 1. stĺpec (ako v drg)
+        if img0_for_cbar:
+            pos_col0_ax2 = axs[2,0].get_position()
+            cax1_left = pos_col0_ax2.x0
+            cax1_bottom = 0.13 
+            cax1_width = pos_col0_ax2.width
+            cax1_height = 0.025 
+            cax1 = fig.add_axes([cax1_left, cax1_bottom, cax1_width, cax1_height])
+            cb1 = fig.colorbar(img0_for_cbar, cax=cax1, orientation='horizontal')
+            # cb1.set_ticks(...) # Ponecháme default ticks ako v drg
+
+        # Spoločný colorbar pre 2. a 3. stĺpec (ako v drg)
+        if img1_for_cbar:
+            pos_col1_ax2 = axs[2,1].get_position() 
+            pos_col2_ax2 = axs[2,2].get_position() 
+            cax23_left = pos_col1_ax2.x0
+            cax23_bottom = 0.13 
+            cax23_width = (pos_col2_ax2.x0 + pos_col2_ax2.width) - pos_col1_ax2.x0 
+            cax23_height = 0.025
+            cax23 = fig.add_axes([cax23_left, cax23_bottom, cax23_width, cax23_height])
+            cb23 = fig.colorbar(img1_for_cbar, cax=cax23, orientation='horizontal') 
+            # cb23.set_ticks(...) # Ponecháme default ticks ako v drg
+        
+        base_save_name_rec = f"detailed_comparison_mae_reconstruction_{run_name_for_file}"
+        save_fig_path_png_rec = f"{base_save_name_rec}.png"
+        save_fig_path_svg_rec = f"{base_save_name_rec}.svg"
+
+        plt.savefig(save_fig_path_png_rec, dpi=200, bbox_inches='tight') 
+        print(f"Detailná vizualizácia (rekonštrukcia) uložená do: {save_fig_path_png_rec}")
+        plt.savefig(save_fig_path_svg_rec, bbox_inches='tight')
+        print(f"Detailná vizualizácia (rekonštrukcia) uložená aj do: {save_fig_path_svg_rec}")
+        plt.show()
+        plt.close(fig) # Zatvoríme figúru explicitne
     else:
-        print("Nepodarilo sa nájsť dostatok dát pre vizualizáciu najlepšej/najhoršej MAE.")
+        print("Nepodarilo sa nájsť dostatok dát pre plnú detailnú vizualizáciu (rekonštrukcia).")
 
 
 if __name__ == '__main__':
     # --- NASTAVENIA PRE TESTOVANIE (KLASIFIKÁCIA) ---
     # Tieto cesty musia smerovať na výstupy z klasifikačného tréningu (dwc.py)
-    CONFIG_FILE_PATH = r"C:\Users\juraj\Desktop\tradicne_metody\config_clf_R34imgnet_Kmax6_AugMed_LR1e-03_WD1e-04_Ep120_Tmax120_EtaMin1e-07_EdgeW3.0_bs8.txt" # PRÍKLAD! UPRAV!
-    WEIGHTS_FILE_PATH = r"C:\Users\juraj\Desktop\tradicne_metody\best_weights_clf_R34imgnet_Kmax6_AugMed_LR1e-03_WD1e-04_Ep120_Tmax120_EtaMin1e-07_EdgeW3.0_bs8.pth" # PRÍKLAD! UPRAV!
+    # CONFIG_FILE_PATH = r"C:\Users\juraj\Desktop\TRENOVANIE_bakalarka_simul\classification\experiment3_hyper\config_clf_R34imgnet_Kmax6_AugMed_LR1em03_WD1em04_Ep120_Tmax120_EtaMin1em07_EdgeW3.0_bs8.txt" # PRÍKLAD! UPRAV!
+    # WEIGHTS_FILE_PATH = r"C:\Users\juraj\Desktop\TRENOVANIE_bakalarka_simul\classification\experiment3_hyper\best_weights_clf_R34imgnet_Kmax6_AugMed_LR1em03_WD1em04_Ep120_Tmax120_EtaMin1em07_EdgeW3.0_bs8.pth" # PRÍKLAD! UPRAV!
+    
+    # TEST_DATA_PATH = r'C:\Users\juraj\Desktop\TRENOVANIE_bakalarka_simul\split_dataset_tiff_for_dynamic_v_stratified_final\static_test_dataset' # Zostáva rovnaký
+    
+
+
+    # CONFIG_FILE_PATH = r"C:\Users\juraj\Desktop\TRENOVANIE_bakalarka_simul\classification\experiment5_hyper\config_clf_R34imgnet_Kmax6_AugMed_LR1em03_WD1em04_Ep120_Tmax120_EtaMin1em07_EdgeW4.0_bs8.txt" # PRÍKLAD! UPRAV!
+    # WEIGHTS_FILE_PATH = r"C:\Users\juraj\Desktop\TRENOVANIE_bakalarka_simul\classification\experiment5_hyper\best_weights_clf_R34imgnet_Kmax6_AugMed_LR1em03_WD1em04_Ep120_Tmax120_EtaMin1em07_EdgeW4.0_bs8.pth" # PRÍKLAD! UPRAV!
+    
+    # TEST_DATA_PATH = r'C:\Users\juraj\Desktop\TRENOVANIE_bakalarka_simul\split_dataset_tiff_for_dynamic_v_stratified_final\static_test_dataset' # Zostáva rovnaký
+
+    CONFIG_FILE_PATH = r"C:\Users\juraj\Desktop\TRENOVANIE_bakalarka_simul\classification\experiment4_hyper\config_clf_R34imgnet_Kmax6_AugMed_LR1em03_WD1em04_Ep120_Tmax120_EtaMin1em07_EdgeW5.0_bs8.txt" # PRÍKLAD! UPRAV!
+    WEIGHTS_FILE_PATH = r"C:\Users\juraj\Desktop\TRENOVANIE_bakalarka_simul\classification\experiment4_hyper\best_weights_clf_R34imgnet_Kmax6_AugMed_LR1em03_WD1em04_Ep120_Tmax120_EtaMin1em07_EdgeW5.0_bs8.pth" # PRÍKLAD! UPRAV!
     
     TEST_DATA_PATH = r'C:\Users\juraj\Desktop\TRENOVANIE_bakalarka_simul\split_dataset_tiff_for_dynamic_v_stratified_final\static_test_dataset' # Zostáva rovnaký
-    
+
+
     DEVICE_TO_USE = 'cuda'
 
     script_start_time = time.time()

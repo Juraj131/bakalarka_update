@@ -11,7 +11,8 @@ import tifffile as tiff
 import matplotlib.pyplot as plt
 import torchvision.transforms.v2 as T # Ak používaš augmentácie v datasete (pre test nie)
 #Ak používaš smp.Unet, importuj ho. Ak vlastnú architektúru, definuj ju.
-import segmentation_models_pytorch as smp 
+import segmentation_models_pytorch as smp
+from tqdm import tqdm
 
 # Importuj aj vlastnú architektúru, ak ju používaš
 # from tvoj_modul_s_architekturou import CustomResUNet 
@@ -319,12 +320,15 @@ def evaluate_and_visualize_model(
     all_ssim = []
     
     # Sledovanie najlepšej a najhoršej MAE
-    # Inicializujeme indexy na -1, aby sme vedeli, či sme našli nejaké vzorky
     best_mae_sample_info = {"mae": float('inf'), "index": -1, "pred_denorm": None, "gt_denorm": None, "input_orig": None}
     worst_mae_sample_info = {"mae": -1.0, "index": -1, "pred_denorm": None, "gt_denorm": None, "input_orig": None}
+    avg_mae_sample_info = {"mae": -1.0, "index": -1, "pred_denorm": None, "gt_denorm": None, "input_orig": None, "diff_from_avg_mae": float('inf')}
+
+    all_pixel_errors_flat = []
+    all_samples_data_for_avg = [] # Na uloženie (mae, input_orig, gt_denorm, pred_denorm, index)
     
     with torch.no_grad():
-        for i, batch_data in enumerate(test_loader):
+        for i, batch_data in tqdm(enumerate(test_loader), total=len(test_loader), desc="Evaluácia batchov"):
             if batch_data is None or batch_data[0] is None:
                 print(f"Preskakujem chybný batch v teste, iterácia {i}")
                 continue
@@ -334,7 +338,7 @@ def evaluate_and_visualize_model(
 
             pred_norm_batch = net(input_norm_batch)
 
-            for k in range(pred_norm_batch.size(0)):
+            for k in range(pred_norm_batch.size(0)): # Nechávam tqdm pre vnútornú slučku, ak je test_loader malý
                 current_sample_idx = i * test_loader.batch_size + k 
                 if current_sample_idx >= len(test_dataset): continue
 
@@ -344,35 +348,38 @@ def evaluate_and_visualize_model(
                 pred_denorm_sample_tensor = denormalize_target_z_score(pred_norm_sample_tensor, target_original_mean, target_original_std)
                 pred_denorm_sample_numpy = pred_denorm_sample_tensor.cpu().numpy().squeeze()
 
-                mae = np.mean(np.abs(pred_denorm_sample_numpy - target_orig_sample_numpy))
+                # Zber chýb pre histogram
+                current_pixel_errors = np.abs(pred_denorm_sample_numpy - target_orig_sample_numpy)
+                all_pixel_errors_flat.extend(current_pixel_errors.flatten().tolist())
+
+                mae = np.mean(current_pixel_errors) # MAE je priemer absolútnych chýb
                 mse = np.mean((pred_denorm_sample_numpy - target_orig_sample_numpy)**2)
                 
                 all_mae_denorm.append(mae)
                 all_mse_denorm.append(mse)
+
+                # Načítanie pôvodného vstupu pre všetky vzorky (potrebné pre avg case)
+                img_path_current = test_dataset.image_list[current_sample_idx]
+                current_input_orig = tiff.imread(img_path_current)
+                all_samples_data_for_avg.append((mae, current_input_orig, target_orig_sample_numpy, pred_denorm_sample_numpy, current_sample_idx))
+
 
                 if SKIMAGE_AVAILABLE:
                     psnr_val, ssim_val = calculate_psnr_ssim(target_orig_sample_numpy, pred_denorm_sample_numpy)
                     if not np.isnan(psnr_val): all_psnr.append(psnr_val)
                     if not np.isnan(ssim_val): all_ssim.append(ssim_val)
                 
-                # Aktualizácia najlepšej MAE
                 if mae < best_mae_sample_info["mae"]:
                     best_mae_sample_info["mae"] = mae
                     best_mae_sample_info["index"] = current_sample_idx
-                    # Uložíme si potrebné dáta pre neskoršie vykreslenie
-                    # Načítame pôvodný zabalený vstup pre túto vzorku
-                    img_path_best = test_dataset.image_list[current_sample_idx]
-                    best_mae_sample_info["input_orig"] = tiff.imread(img_path_best)
+                    best_mae_sample_info["input_orig"] = current_input_orig
                     best_mae_sample_info["gt_denorm"] = target_orig_sample_numpy
                     best_mae_sample_info["pred_denorm"] = pred_denorm_sample_numpy
                 
-                # Aktualizácia najhoršej MAE
                 if mae > worst_mae_sample_info["mae"]: 
                     worst_mae_sample_info["mae"] = mae
                     worst_mae_sample_info["index"] = current_sample_idx
-                    # Uložíme si potrebné dáta pre neskoršie vykreslenie
-                    img_path_worst = test_dataset.image_list[current_sample_idx]
-                    worst_mae_sample_info["input_orig"] = tiff.imread(img_path_worst)
+                    worst_mae_sample_info["input_orig"] = current_input_orig
                     worst_mae_sample_info["gt_denorm"] = target_orig_sample_numpy
                     worst_mae_sample_info["pred_denorm"] = pred_denorm_sample_numpy
 
@@ -388,97 +395,185 @@ def evaluate_and_visualize_model(
         print(f"Priemerný PSNR: {avg_psnr:.2f} dB")
         print(f"Priemerný SSIM: {avg_ssim:.4f}")
     
+    # Nájdenie vzorky najbližšej k priemernej MAE
+    if not np.isnan(avg_mae) and all_samples_data_for_avg:
+        min_diff_to_avg_mae = float('inf')
+        avg_candidate_data = None
+        for sample_mae_val, s_input_orig, s_gt_denorm, s_pred_denorm, s_idx in all_samples_data_for_avg:
+            diff = abs(sample_mae_val - avg_mae)
+            if diff < min_diff_to_avg_mae:
+                min_diff_to_avg_mae = diff
+                avg_candidate_data = (sample_mae_val, s_input_orig, s_gt_denorm, s_pred_denorm, s_idx)
+        
+        if avg_candidate_data:
+            avg_mae_sample_info["mae"] = avg_candidate_data[0]
+            avg_mae_sample_info["input_orig"] = avg_candidate_data[1]
+            avg_mae_sample_info["gt_denorm"] = avg_candidate_data[2]
+            avg_mae_sample_info["pred_denorm"] = avg_candidate_data[3]
+            avg_mae_sample_info["index"] = avg_candidate_data[4]
+            avg_mae_sample_info["diff_from_avg_mae"] = min_diff_to_avg_mae
+
+
     print("\n--- Extrémne Hodnoty MAE (len logovanie) ---")
     if best_mae_sample_info["index"] != -1:
         print(f"Najlepšia MAE na vzorke: {best_mae_sample_info['mae']:.4f} (index: {best_mae_sample_info['index']})")
+    if avg_mae_sample_info["index"] != -1:
+        print(f"Vzorka najbližšie k priemernej MAE ({avg_mae:.4f}): MAE={avg_mae_sample_info['mae']:.4f} (index: {avg_mae_sample_info['index']}, rozdiel: {avg_mae_sample_info['diff_from_avg_mae']:.4f})")
     if worst_mae_sample_info["index"] != -1:
         print(f"Najhoršia MAE na vzorke: {worst_mae_sample_info['mae']:.4f} (index: {worst_mae_sample_info['index']})")
 
+    run_name_for_files = os.path.splitext(os.path.basename(weights_path))[0].replace("best_weights_", "")
 
-    # --- Vizualizácia Najlepšej a Najhoršej MAE ---
-    if best_mae_sample_info["index"] != -1 and worst_mae_sample_info["index"] != -1:
-        print(f"\nVizualizujem a ukladám najlepší a najhorší MAE prípad...")
+    # Uloženie extrémnych MAE hodnôt do textového súboru
+    if best_mae_sample_info["index"] != -1 or worst_mae_sample_info["index"] != -1 or avg_mae_sample_info["index"] != -1:
+        extreme_mae_log_path = f"extreme_mae_values_{run_name_for_files}.txt"
+        with open(extreme_mae_log_path, 'w') as f:
+            f.write(f"Experiment: {run_name_for_files}\n")
+            f.write("--- Extrémne a Priemerné Hodnoty MAE ---\n")
+            if best_mae_sample_info["index"] != -1:
+                f.write(f"Najlepšia MAE: {best_mae_sample_info['mae']:.6f} (index: {best_mae_sample_info['index']})\n")
+            else:
+                f.write("Najlepšia MAE: N/A\n")
+            
+            if avg_mae_sample_info["index"] != -1:
+                f.write(f"Vzorka najbližšie k priemernej MAE ({avg_mae:.6f}): MAE={avg_mae_sample_info['mae']:.6f} (index: {avg_mae_sample_info['index']}, rozdiel od priemeru: {avg_mae_sample_info['diff_from_avg_mae']:.6f})\n")
+            else:
+                f.write("Vzorka najbližšie k priemernej MAE: N/A\n")
+
+            if worst_mae_sample_info["index"] != -1:
+                f.write(f"Najhoršia MAE: {worst_mae_sample_info['mae']:.6f} (index: {worst_mae_sample_info['index']})\n")
+            else:
+                f.write("Najhoršia MAE: N/A\n")
+            f.write(f"\nPriemerná MAE (celý dataset): {avg_mae:.6f}\n")
+        print(f"Extrémne a priemerné MAE hodnoty uložené do: {extreme_mae_log_path}")
+
+    # --- Histogram Chýb ---
+    if all_pixel_errors_flat:
+        all_pixel_errors_flat_np = np.array(all_pixel_errors_flat)
+        plt.figure(figsize=(12, 7))
+        plt.hist(all_pixel_errors_flat_np, bins=100, color='dodgerblue', edgecolor='black', alpha=0.7)
+        plt.title('Histogram Absolútnych Chýb Predikcie (všetky pixely)', fontsize=16)
+        plt.xlabel('Absolútna Chyba (radiány)', fontsize=14)
+        plt.ylabel('Počet Pixelov', fontsize=14)
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.yscale('log') 
+        hist_save_path_png = f"error_histogram_{run_name_for_files}.png"
+        hist_save_path_svg = f"error_histogram_{run_name_for_files}.svg"
+        plt.savefig(hist_save_path_png)
+        plt.savefig(hist_save_path_svg)
+        print(f"Histogram chýb uložený do: {hist_save_path_png} a {hist_save_path_svg}")
+        plt.show()
+        plt.close()
+
+
+    # --- Vizualizácia Najlepšej, Priemernej a Najhoršej MAE s Mapami Chýb (Nové Usporiadanie) ---
+    if best_mae_sample_info["index"] != -1 and worst_mae_sample_info["index"] != -1 and avg_mae_sample_info["index"] != -1:
+        print(f"\nVizualizujem a ukladám najlepší, priemerný a najhorší MAE prípad (nové usporiadanie)...")
         
-        fig, axs = plt.subplots(2, 3, figsize=(18, 10)) # 2 riadky, 3 stĺpce
-        # run_name_for_title = os.path.splitext(os.path.basename(weights_path))[0].replace("best_weights_", "")
-        # fig.suptitle(f"Najlepšia a Najhoršia MAE Predikcia\nRun: {run_name_for_title}", fontsize=16, y=0.98) # ODSTRÁNENÝ ALEBO ZAKOMENTOVANÝ RIADOK
+        samples_to_plot = [
+            ("Min MAE", best_mae_sample_info),
+            ("Avg MAE", avg_mae_sample_info),
+            ("Max MAE", worst_mae_sample_info)
+        ]
 
-        # Riadok 1: Najlepšia MAE
-        axs[0, 0].imshow(best_mae_sample_info["input_orig"], cmap='gray')
-        axs[0, 0].set_title("Zabalený obraz", fontsize=14)
-        axs[0, 0].axis('off')
+        all_input_orig_col1 = []
+        all_gt_pred_col23 = []
 
-        im_gt_best = axs[0, 1].imshow(best_mae_sample_info["gt_denorm"], cmap='gray')
-        axs[0, 1].set_title("Rozbalený referenčný obraz", fontsize=14)
-        axs[0, 1].axis('off')
-        # fig.colorbar(im_gt_best, ax=axs[0, 1], fraction=0.046, pad=0.04)
+        for _, sample_info in samples_to_plot:
+            all_input_orig_col1.append(sample_info["input_orig"])
+            all_gt_pred_col23.append(sample_info["gt_denorm"])
+            all_gt_pred_col23.append(sample_info["pred_denorm"])
 
+        vmin_col1 = np.min([img.min() for img in all_input_orig_col1]) if all_input_orig_col1 else 0
+        vmax_col1 = np.max([img.max() for img in all_input_orig_col1]) if all_input_orig_col1 else 1
 
-        common_min_best = min(best_mae_sample_info["gt_denorm"].min(), best_mae_sample_info["pred_denorm"].min())
-        common_max_best = max(best_mae_sample_info["gt_denorm"].max(), best_mae_sample_info["pred_denorm"].max())
-        im_pred_best = axs[0, 2].imshow(best_mae_sample_info["pred_denorm"], cmap='gray', vmin=common_min_best, vmax=common_max_best)
-        axs[0, 2].set_title(f"Najlepšia predikcia\nMAE: {best_mae_sample_info['mae']:.4f}", fontsize=14)
-        axs[0, 2].axis('off')
-        # fig.colorbar(im_pred_best, ax=axs[0, 2], fraction=0.046, pad=0.04)
+        vmin_col23 = np.min([img.min() for img in all_gt_pred_col23]) if all_gt_pred_col23 else 0
+        vmax_col23 = np.max([img.max() for img in all_gt_pred_col23]) if all_gt_pred_col23 else 1
+
+        fig, axs = plt.subplots(3, 4, figsize=(16, 13)) # Mierne upravená výška pre lepšie prispôsobenie
+
+        row_titles = ["Min MAE", "Avg MAE", "Max MAE"]
+        col_titles = ["Zabalený obraz", "Rozbalený referenčný obraz", "Predikcia", "Absolútna chyba"]
+
+        error_map_mappables = []
+
+        for i, (row_title_text, sample_info) in enumerate(samples_to_plot):
+            img0 = axs[i, 0].imshow(sample_info["input_orig"], cmap='gray', vmin=vmin_col1, vmax=vmax_col1)
+            img1 = axs[i, 1].imshow(sample_info["gt_denorm"], cmap='gray', vmin=vmin_col23, vmax=vmax_col23)
+            img2 = axs[i, 2].imshow(sample_info["pred_denorm"], cmap='gray', vmin=vmin_col23, vmax=vmax_col23)
+            
+            error_map = np.abs(sample_info["pred_denorm"] - sample_info["gt_denorm"])
+            img3 = axs[i, 3].imshow(error_map, cmap='viridis')
+            error_map_mappables.append(img3)
+
+        # Nastavenie titulkov stĺpcov (nad prvým riadkom)
+        for j, col_title_text in enumerate(col_titles):
+            axs[0, j].set_title(col_title_text, fontsize=16, pad=20) # Veľkosť písma 16
+
+        for ax_row in axs:
+            for ax in ax_row:
+                ax.axis('off')
         
-        # Riadok 2: Najhoršia MAE
-        axs[1, 0].imshow(worst_mae_sample_info["input_orig"], cmap='gray')
-        axs[1, 0].set_title("Zabalený obraz", fontsize=14)
-        axs[1, 0].axis('off')
+        for i in range(3):
+            fig.colorbar(error_map_mappables[i], ax=axs[i, 3], orientation='vertical', fraction=0.046, pad=0.02, aspect=15)
 
-        im_gt_worst = axs[1, 1].imshow(worst_mae_sample_info["gt_denorm"], cmap='gray')
-        axs[1, 1].set_title("Rozbalený referenčný obraz", fontsize=14)
-        axs[1, 1].axis('off')
-        # fig.colorbar(im_gt_worst, ax=axs[1, 1], fraction=0.046, pad=0.04)
+        # Úprava rozloženia
+        plt.subplots_adjust(left=0.05, right=0.95, bottom=0.18, top=0.90, wspace=0.0, hspace=0.06) # Zmenšený 'left' parameter
 
-        common_min_worst = min(worst_mae_sample_info["gt_denorm"].min(), worst_mae_sample_info["pred_denorm"].min())
-        common_max_worst = max(worst_mae_sample_info["gt_denorm"].max(), worst_mae_sample_info["pred_denorm"].max())
-        im_pred_worst = axs[1, 2].imshow(worst_mae_sample_info["pred_denorm"], cmap='gray', vmin=common_min_worst, vmax=common_max_worst)
-        axs[1, 2].set_title(f"Najhoršia predikcia\nMAE: {worst_mae_sample_info['mae']:.4f}", fontsize=14)
-        axs[1, 2].axis('off')
-        # fig.colorbar(im_pred_worst, ax=axs[1, 2], fraction=0.046, pad=0.04)
+        # Spoločný colorbar pre 1. stĺpec
+        pos_col0_ax2 = axs[2,0].get_position() # Pozícia spodného obrázku v prvom stĺpci
+        cax1_left = pos_col0_ax2.x0
+        cax1_bottom = 0.13 # Mierne nižšie
+        cax1_width = pos_col0_ax2.width
+        cax1_height = 0.025 # Trochu tenší
+        cax1 = fig.add_axes([cax1_left, cax1_bottom, cax1_width, cax1_height])
+        cb1 = fig.colorbar(img0, cax=cax1, orientation='horizontal')
+        # cb1.set_label('Rozsah zabalených obrazov', fontsize=10) # Odstránený label
 
-        plt.tight_layout() # Odstránený rect, keďže suptitle už nie je
+        # Spoločný colorbar pre 2. a 3. stĺpec
+        pos_col1_ax2 = axs[2,1].get_position() 
+        pos_col2_ax2 = axs[2,2].get_position() 
         
-        run_name_for_title = os.path.splitext(os.path.basename(weights_path))[0].replace("best_weights_", "") # Tento riadok môže zostať, ak ho používate pre názov súboru
-        base_save_name = f"best_worst_mae_visualization_{run_name_for_title}"
+        cax23_left = pos_col1_ax2.x0
+        cax23_bottom = 0.13 # Rovnaká výška ako cb1
+        cax23_width = (pos_col2_ax2.x0 + pos_col2_ax2.width) - pos_col1_ax2.x0 
+        cax23_height = 0.025 # Trochu tenší
+        cax23 = fig.add_axes([cax23_left, cax23_bottom, cax23_width, cax23_height])
+        cb23 = fig.colorbar(img1, cax=cax23, orientation='horizontal') 
+        # cb23.set_label('Rozsah referenčných a predikovaných obrazov', fontsize=10) # Odstránený label
+        
+        base_save_name = f"detailed_comparison_mae_errors_{run_name_for_files}"
         save_fig_path_png = f"{base_save_name}.png"
         save_fig_path_svg = f"{base_save_name}.svg"
 
-        plt.savefig(save_fig_path_png)
-        print(f"Vizualizácia najlepšej/najhoršej MAE uložená do: {save_fig_path_png}")
+        plt.savefig(save_fig_path_png, dpi=200) 
+        print(f"Detailná vizualizácia (nové usporiadanie) uložená do: {save_fig_path_png}")
         
         plt.savefig(save_fig_path_svg)
-        print(f"Vizualizácia najlepšej/najhoršej MAE uložená aj do: {save_fig_path_svg}")
+        print(f"Detailná vizualizácia (nové usporiadanie) uložená aj do: {save_fig_path_svg}")
         
         plt.show()
+        plt.close() 
     else:
-        print("Nepodarilo sa nájsť dostatok dát pre vizualizáciu najlepšej/najhoršej MAE.")
+        print("Nepodarilo sa nájsť dostatok dát pre plnú detailnú vizualizáciu.")
 
+if __name__ == "__main__":
+    # Tu musíte zadať cesty k vašim súborom
+    config_file_path = r"C:\\Users\\juraj\\Desktop\\TRENOVANIE_bakalarka_simul\\optimalizacia_hype\\trenovanie_5\\config_R34imgnet_direct_MAE_GDL0p3_AugMedium_LR5em04_WD1em04_Ep120_ESp30_Tmax120_EtaMin1em07_bs8_bs8.txt"  # Nahraďte skutočnou cestou
+    weights_file_path = r"C:\\Users\\juraj\\Desktop\\TRENOVANIE_bakalarka_simul\\optimalizacia_hype\\trenovanie_5\\best_weights_R34imgnet_direct_MAE_GDL0p3_AugMedium_LR5em04_WD1em04_Ep120_ESp30_Tmax120_EtaMin1em07_bs8_bs8.pth" # Nahraďte skutočnou cestou
+    test_dataset_directory = r"C:\\Users\\juraj\\Desktop\\TRENOVANIE_bakalarka_simul\\split_dataset_tiff_for_dynamic_v_stratified_final\\static_test_dataset" # Nahraďte skutočnou cestou
 
-if __name__ == '__main__':
-    # --- NASTAVENIA PRE TESTOVANIE ---
-    CONFIG_FILE_PATH = r"C:\Users\juraj\Desktop\TRENOVANIE_bakalarka_simul\optimalizacia_hype\trenovanie_5\config_R34imgnet_direct_MAE_GDL0p3_AugMedium_LR5em04_WD1em04_Ep120_ESp30_Tmax120_EtaMin1em07_bs8_bs8.txt" 
-    WEIGHTS_FILE_PATH = r"C:\Users\juraj\Desktop\TRENOVANIE_bakalarka_simul\optimalizacia_hype\trenovanie_5\best_weights_R34imgnet_direct_MAE_GDL0p3_AugMedium_LR5em04_WD1em04_Ep120_ESp30_Tmax120_EtaMin1em07_bs8_bs8.pth"
-    TEST_DATA_PATH = r'C:\Users\juraj\Desktop\TRENOVANIE_bakalarka_simul\split_dataset_tiff_for_dynamic_v_stratified_final\static_test_dataset'
-    # IMAGE_INDEX_TO_VISUALIZE už nie je potrebný pre hlavný graf, ale môžete ho ponechať, ak chcete pridať späť pôvodnú vizualizáciu jedného obrázka.
-    DEVICE_TO_USE = 'cuda'
-
-    script_start_time = time.time()
-
-    if not os.path.exists(CONFIG_FILE_PATH):
-        print(f"CHYBA: Konfiguračný súbor '{CONFIG_FILE_PATH}' neexistuje. Skontroluj cestu.")
-    elif not os.path.exists(WEIGHTS_FILE_PATH):
-        print(f"CHYBA: Súbor s váhami '{WEIGHTS_FILE_PATH}' neexistuje. Skontroluj cestu.")
+    # Kontrola, či súbory existujú, predtým ako zavoláte funkciu (voliteľné, ale odporúčané)
+    if not os.path.exists(config_file_path):
+        print(f"CHYBA: Konfiguračný súbor neexistuje: {config_file_path}")
+    elif not os.path.exists(weights_file_path):
+        print(f"CHYBA: Súbor s váhami neexistuje: {weights_file_path}")
+    elif not os.path.isdir(test_dataset_directory): # Kontrola, či je to adresár
+        print(f"CHYBA: Adresár testovacieho datasetu neexistuje: {test_dataset_directory}")
     else:
         evaluate_and_visualize_model(
-            config_path=CONFIG_FILE_PATH,
-            weights_path=WEIGHTS_FILE_PATH,
-            test_dataset_path=TEST_DATA_PATH,
-            # image_index_to_show=IMAGE_INDEX_TO_VISUALIZE, # Odstránené z volania
-            device_str=DEVICE_TO_USE
+            config_path=config_file_path,
+            weights_path=weights_file_path,
+            test_dataset_path=test_dataset_directory,
+            device_str='cuda' # alebo 'cpu'
         )
-    
-    script_end_time = time.time()
-    total_script_time = script_end_time - script_start_time
-    print(f"\nCelkový čas vykonávania skriptu: {total_script_time:.2f} sekúnd ({time.strftime('%H:%M:%S', time.gmtime(total_script_time))}).")
