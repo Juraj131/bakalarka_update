@@ -1,0 +1,148 @@
+% PhaseUnwrap2D.m - Upravené pre spracovanie datasetu TIFF obrázkov
+% Pôvodný autor: Aaron James Lemmer
+% Úpravy pre dataset, Tiff objekt a názvy súborov: Gemini
+
+% --- INICIALIZÁCIA ---
+clear all; % Odporúča sa na vyčistenie premenných z predchádzajúcich behov
+close all; % Zatvorí všetky otvorené obrázky
+clc;       % Vymaže Command Window
+
+disp('----------------------------------------------------');
+disp('Skript na rozbalenie fázového datasetu (Goldstein)');
+disp('----------------------------------------------------');
+
+% --- DEFINUJTE CESTY K ADRESÁROM ---
+% !!! DÔLEŽITÉ: Upravte tieto cesty podľa vašej štruktúry adresárov !!!
+vstupny_adresar = 'C:\Users\juraj\Desktop\matlab_goldstain\2d-phase-unwrap-goldstein\static_test_dataset\images'; % Príklad: 'C:\MojeData\VstupneObrazky'
+vystupny_adresar = 'C:\Users\juraj\Desktop\matlab_goldstain\2d-phase-unwrap-goldstein\goldstein_unwrapped'; % Príklad: 'C:\MojeData\VystupneObrazky_Rozbalene'
+
+disp(['Vstupný adresár: ', vstupny_adresar]);
+disp(['Výstupný adresár: ', vystupny_adresar]);
+
+% Vytvorenie výstupného adresára, ak neexistuje
+if ~exist(vystupny_adresar, 'dir')
+   mkdir(vystupny_adresar);
+   disp(['Vytvorený výstupný adresár: ', vystupny_adresar]);
+end
+
+% Získanie zoznamu všetkých TIFF súborov vo vstupnom adresári
+tiff_files_pattern = '*.tiff'; % Nastavené pre .tiff, upravte podľa potreby
+subory = dir(fullfile(vstupny_adresar, tiff_files_pattern));
+
+if isempty(subory)
+    error(['Vo vstupnom adresári "', vstupny_adresar, '" neboli nájdené žiadne súbory typu "', tiff_files_pattern, '". Skontrolujte cestu a koncovku súborov.']);
+end
+
+num_total_subory = length(subory);
+disp(['Nájdených súborov na spracovanie: ', num2str(num_total_subory)]);
+disp(' ');
+
+% --- HLAVNÝ CYKLUS PRE SPRACOVANIE KAŽDÉHO SÚBORU ---
+for idx_subor = 1:num_total_subory
+    
+    nazov_suboru = subory(idx_subor).name;
+    plna_cesta_vstup = fullfile(vstupny_adresar, nazov_suboru);
+    
+    disp(['--- Spracúva sa súbor (', num2str(idx_subor), '/', num2str(num_total_subory), '): ', nazov_suboru, ' ---']);
+    
+    % NAČÍTANIE AKTUÁLNEHO TIFF OBRÁZKA
+    try
+        phaseAng_single = imread(plna_cesta_vstup);
+        disp(['Súbor "', nazov_suboru, '" úspešne načítaný.']);
+    catch ME
+        disp(['CHYBA: Nepodarilo sa načítať súbor: ', plna_cesta_vstup]);
+        disp(['Chybové hlásenie: ', ME.message]);
+        disp('Preskakujem tento súbor a pokračujem ďalším.');
+        disp(' ');
+        continue; % Prejde na ďalší súbor v cykle
+    end
+
+    % Konverzia na double pre výpočty
+    if ~isa(phaseAng_single, 'double')
+        phaseAng = double(phaseAng_single);
+    else
+        phaseAng = phaseAng_single; 
+    end
+
+    [num_row, num_col] = size(phaseAng);
+    mask = ones(num_row, num_col);
+    border = ~mask; 
+
+    % --- GOLDSTEINOV ALGORITMUS NA ROZBALENIE FÁZY ---
+    [residues, num_residues] = LocateResidues(phaseAng, border);
+    
+    branch_cuts = zeros(num_row, num_col); 
+    num_dipoles = 0; 
+    % Ak chcete použiť spracovanie dipólov, odkomentujte nasledujúce riadky:
+    % disp('Krok 2: Odstraňovanie dipólov (ak je aktívne)...');
+    % [residues, branch_cuts, num_dipoles] = Dipoles(num_row, num_col, branch_cuts, residues);
+    % disp(['Počet spracovaných dipólov: ', num2str(num_dipoles)]);
+    
+    num_residues_for_branchcuts = num_residues - 2*num_dipoles; 
+    [branch_cuts_updated] = BranchCuts(branch_cuts, residues, num_residues_for_branchcuts, border);
+    branch_cuts = branch_cuts_updated; 
+    
+    phase_soln = nan(size(branch_cuts)); 
+    [num_regions, phase_soln_updated, ~] = UnwrapAroundCuts(phaseAng, phase_soln, branch_cuts, border);
+    phase_soln = phase_soln_updated; 
+
+    % --- ULOŽENIE VÝSLEDKU AKO 32-BIT TIFF pomocou Tiff objektu ---
+    % Extrakcia identifikátora a vytvorenie nového názvu
+    [~, meno_bez_pripony_original, ~] = fileparts(nazov_suboru);
+    prefix_na_odstranenie = 'wrappedbg_';
+    if startsWith(meno_bez_pripony_original, prefix_na_odstranenie)
+        identifikator_obrazka = extractAfter(meno_bez_pripony_original, prefix_na_odstranenie);
+    else
+        identifikator_obrazka = meno_bez_pripony_original;
+        disp(['VAROVANIE: Súbor "', nazov_suboru, '" nemá očakávaný prefix "wrappedbg_". Použije sa celý názov bez prípony ako identifikátor.']);
+    end
+    vystupny_nazov_suboru = ['unwrapped_', identifikator_obrazka, '.tiff'];
+    plna_cesta_vystup = fullfile(vystupny_adresar, vystupny_nazov_suboru);
+    
+    disp(['Ukladám rozbalený obrázok (pomocou Tiff objektu) do: ', plna_cesta_vystup]);
+    
+    if isempty(phase_soln) || all(isnan(phase_soln(:)))
+        disp('CHYBA PRED ULOŽENÍM: Matica phase_soln je prázdna alebo obsahuje iba NaN. Súbor sa neuloží.');
+    else
+        t = []; % Inicializácia premennej t
+        try
+            data_na_ulozenie = single(phase_soln);
+            
+            t = Tiff(plna_cesta_vystup, 'w');
+            
+            tagstruct.ImageLength = size(data_na_ulozenie, 1);
+            tagstruct.ImageWidth = size(data_na_ulozenie, 2);
+            tagstruct.Photometric = Tiff.Photometric.MinIsBlack;
+            tagstruct.BitsPerSample = 32;
+            tagstruct.SamplesPerPixel = 1;
+            tagstruct.SampleFormat = Tiff.SampleFormat.IEEEFP;
+            tagstruct.PlanarConfiguration = Tiff.PlanarConfiguration.Chunky;
+            tagstruct.Compression = Tiff.Compression.None;
+            t.setTag(tagstruct);
+            
+            t.write(data_na_ulozenie);
+            t.close();
+            
+            disp('Uloženie úspešné (pomocou Tiff objektu).');
+            
+        catch ME_tiff_write
+            disp(['CHYBA PRI UKLADANÍ (pomocou Tiff objektu): Nepodarilo sa uložiť rozbalený obrázok: ', plna_cesta_vystup]);
+            disp(['Chybové hlásenie MATLABu: ', ME_tiff_write.message]);
+            if isa(t, 'Tiff') 
+                try
+                    t.close();
+                catch
+                    disp('Nepodarilo sa núdzovo zatvoriť Tiff objekt.');
+                end
+            end
+        end
+    end
+    
+    disp(' '); 
+    
+% --- KONIEC HLAVNÉHO CYKLU ---
+end
+
+disp('----------------------------------------------------');
+disp('Spracovanie všetkých súborov v datasete dokončené.');
+disp('----------------------------------------------------');
